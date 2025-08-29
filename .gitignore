@@ -1,0 +1,8 @@
+/build/
+/config.txt
+/keywords.txt
+/search_log.txt
+/search_results.txt
+/test/
+/dist/
+/.venv/
