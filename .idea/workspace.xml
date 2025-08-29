@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment="убрал папку тессеракта" />
+    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment=".">
+      <change afterPath="$PROJECT_DIR$/poiskV4.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -52,6 +54,7 @@
     "Python.scriptTry.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "git-widget-placeholder": "master",
     "last_opened_file_path": "C:/Users/Leonova.2P2178/PyCharmMiscProject"
   }
 }]]></component>
@@ -247,7 +250,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756452052094</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary=".">
+      <option name="closed" value="true" />
+      <created>1756452344094</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1756452344094</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -264,6 +275,7 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="добавил gitignore и readme" />
     <MESSAGE value="убрал папку тессеракта" />
-    <option name="LAST_COMMIT_MESSAGE" value="убрал папку тессеракта" />
+    <MESSAGE value="." />
+    <option name="LAST_COMMIT_MESSAGE" value="." />
   </component>
 </project>
