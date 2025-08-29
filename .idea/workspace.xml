@@ -4,8 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment=".">
-      <change afterPath="$PROJECT_DIR$/poiskV4.py" afterDir="false" />
+    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment="добавил основной файл">
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -258,7 +258,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756452344094</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="добавил основной файл">
+      <option name="closed" value="true" />
+      <created>1756452629865</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1756452629865</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -276,6 +284,7 @@
     <MESSAGE value="добавил gitignore и readme" />
     <MESSAGE value="убрал папку тессеракта" />
     <MESSAGE value="." />
-    <option name="LAST_COMMIT_MESSAGE" value="." />
+    <MESSAGE value="добавил основной файл" />
+    <option name="LAST_COMMIT_MESSAGE" value="добавил основной файл" />
   </component>
 </project>
