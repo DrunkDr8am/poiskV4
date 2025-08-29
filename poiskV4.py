@@ -3,8 +3,6 @@ import fnmatch
 import sys
 import tempfile
 import zipfile
-import requests
-from pathlib import Path
 import warnings
 from io import BytesIO
 from typing import List, Dict, Set
@@ -13,8 +11,6 @@ import configparser
 from tqdm import tqdm
 import time
 import logging
-import shutil
-
 
 def setup_portable_tesseract():
     """Настройка портативного Tesseract OCR"""
@@ -599,10 +595,7 @@ def main():
 
     if results:
         logging.info(f"Найдено совпадений в {len(results)} файлах:")
-        for file, found_keywords in results.items():
-            logging.info(f"Файл: {file}")
-            logging.info(f"Найденные ключевые слова: {', '.join(found_keywords)}")
-        logging.info(f"Результаты также сохранены в файл {output_file}")
+        logging.info(f"Результаты сохранены в файл {output_file}")
     else:
         logging.info("Ничего не найдено.")
 
