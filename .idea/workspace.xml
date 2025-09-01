@@ -4,17 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment="main работает, а gui пока нет до конца.">
-      <change afterPath="$PROJECT_DIR$/.idea/PyCharmMiscProject.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/guiV2.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/file_processing.py" beforeDir="false" afterPath="$PROJECT_DIR$/file_processing.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/gui.py" beforeDir="false" afterPath="$PROJECT_DIR$/gui.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-    </list>
+    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment="." />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -71,7 +61,7 @@
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "git-widget-placeholder": "test",
+    "git-widget-placeholder": "test1",
     "last_opened_file_path": "C:/Users/Leonova.2P2178/PyCharmMiscProject/test/test"
   }
 }]]></component>
@@ -254,7 +244,23 @@
       <option name="project" value="LOCAL" />
       <updated>1756476229721</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="все работает, но нужно доработать интерфейс и сохранение.">
+      <option name="closed" value="true" />
+      <created>1756734698748</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1756734698748</updated>
+    </task>
+    <task id="LOCAL-00009" summary=".">
+      <option name="closed" value="true" />
+      <created>1756735155937</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1756735155937</updated>
+    </task>
+    <option name="localTasksCounter" value="10" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -271,10 +277,11 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="добавил gitignore и readme" />
     <MESSAGE value="убрал папку тессеракта" />
-    <MESSAGE value="." />
     <MESSAGE value="добавил основной файл" />
     <MESSAGE value="обновил readme" />
     <MESSAGE value="main работает, а gui пока нет до конца." />
-    <option name="LAST_COMMIT_MESSAGE" value="main работает, а gui пока нет до конца." />
+    <MESSAGE value="все работает, но нужно доработать интерфейс и сохранение." />
+    <MESSAGE value="." />
+    <option name="LAST_COMMIT_MESSAGE" value="." />
   </component>
 </project>
