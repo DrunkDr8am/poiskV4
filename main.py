@@ -75,6 +75,13 @@ def main():
     # Проверяем зависимости
     check_dependencies()
 
+    config['has_pdf'] = HAS_PDF
+    config['has_docx'] = HAS_DOCX
+    config['has_excel'] = HAS_EXCEL
+    config['has_7z'] = HAS_7Z
+    config['has_rar'] = HAS_RAR
+    config['has_ocr'] = HAS_OCR
+
     extensions = config['extensions']
     keywords_file = config['keywords_file']
     directory = config['directory']
