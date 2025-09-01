@@ -38,6 +38,10 @@ def search_in_text(text: str) -> Set[str]:
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
     """Распознавание текста с изображения"""
+    # Проверяем доступность OCR через конфиг
+    if not config.get('has_ocr', False):
+        return set()
+
     try:
         from PIL import Image
         import pytesseract
@@ -77,8 +81,6 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
                 found.update(search_in_text(text))
 
                 # Обработка изображений (только если есть OCR)
-                # Предполагаем, что глобальная переменная HAS_OCR доступна, но лучше передавать как параметр
-                # В данном случае, если мы здесь, то OCR доступен (есть fitz и PIL/pytesseract)
                 for img in page.get_images(full=True):
                     xref = img[0]
                     base_image = doc.extract_image(xref)
@@ -104,7 +106,6 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
         found.update(search_in_text(text))
 
         # Изображения из документа (только если есть OCR)
-        # Также предполагаем доступность OCR
         with tempfile.TemporaryDirectory() as temp_dir:
             docx2txt.process(docx_path, temp_dir)
             for img_file in os.listdir(temp_dir):
@@ -150,49 +151,112 @@ def search_in_excel(excel_path: str) -> Set[str]:
     return found
 
 
-def search_in_archive(archive_path: str, extensions: List[str]) -> Set[str]:
-    """Обработка архивов"""
+def search_in_archive(archive_path: str, extensions: List[str], config: dict) -> Set[str]:
+    """Обработка архивов с поддержкой изображений"""
     found = set()
     try:
         if archive_path.endswith('.zip'):
             with zipfile.ZipFile(archive_path, 'r') as z:
                 for file in z.namelist():
                     if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                        with z.open(file) as f:
-                            content = f.read().decode('utf-8', errors='ignore')
-                            found.update(search_in_text(content))
+                        # Для текстовых файлов читаем напрямую
+                        if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
+                            with z.open(file) as f:
+                                content = f.read().decode('utf-8', errors='ignore')
+                                found.update(search_in_text(content))
+                        # Для изображений и других бинарных файлов извлекаем во временную директорию
+                        else:
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                z.extract(file, temp_dir)
+                                extracted_file = os.path.join(temp_dir, file)
+                                if os.path.isfile(extracted_file):
+                                    # Обрабатываем изображения
+                                    if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')):
+                                        found.update(search_in_image(extracted_file, config))
+                                    # Обрабатываем PDF
+                                    elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
+                                        found.update(search_in_pdf(extracted_file, config))
+                                    # Обрабатываем DOCX
+                                    elif file.lower().endswith('.docx') and config.get('has_docx', False):
+                                        found.update(search_in_docx(extracted_file, config))
+                                    # Обрабатываем Excel
+                                    elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                        found.update(search_in_excel(extracted_file))
+
+
         elif archive_path.endswith('.7z'):
             try:
                 import py7zr
             except ImportError:
                 return set()
-            with py7zr.SevenZipFile(archive_path, mode='r') as z:
-                archive_files = z.getnames()
-                for file in archive_files:
-                    if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                        # Исправленный метод обработки 7z архивов
-                        with tempfile.TemporaryDirectory() as temp_dir:
-                            z.extract(path=temp_dir, targets=[file])
-                            extracted_file = os.path.join(temp_dir, file)
-                            if os.path.isfile(extracted_file):
-                                try:
-                                    with open(extracted_file, 'r', encoding='utf-8', errors='ignore') as f:
-                                        content = f.read()
-                                        found.update(search_in_text(content))
-                                except:
-                                    # Если не текстовый файл, пропускаем
-                                    pass
+            with tempfile.TemporaryDirectory() as temp_dir:
+                try:
+                    with py7zr.SevenZipFile(archive_path, mode='r') as z:
+                        # Извлекаем все файлы
+                        z.extractall(path=temp_dir)
+                    # Рекурсивно обходим извлеченные файлы
+                    for root, dirs, files in os.walk(temp_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            relative_path = os.path.relpath(file_path, temp_dir)
+                            if any(fnmatch.fnmatch(relative_path, ext) for ext in extensions):
+                                # Обрабатываем файлы в зависимости от типа
+                                if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
+                                    try:
+                                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                            content = f.read()
+                                            found.update(search_in_text(content))
+                                    except:
+                                        try:
+                                            with open(file_path, 'rb') as f:
+                                                content = f.read().decode('utf-8', errors='ignore')
+                                                found.update(search_in_text(content))
+                                        except:
+                                            pass
+                                elif file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')):
+                                    found.update(search_in_image(file_path, config))
+                                elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
+                                    found.update(search_in_pdf(file_path, config))
+                                elif file.lower().endswith('.docx') and config.get('has_docx', False):
+                                    found.update(search_in_docx(file_path, config))
+                                elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                    found.update(search_in_excel(file_path))
+                except Exception as e:
+                    logging.error(f"Ошибка обработки 7z архива {archive_path}: {e}")
+
         elif archive_path.endswith('.rar'):
             try:
                 import rarfile
             except ImportError:
                 return set()
+
             with rarfile.RarFile(archive_path, 'r') as z:
                 for file in z.namelist():
                     if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                        with z.open(file) as f:
-                            content = f.read().decode('utf-8', errors='ignore')
-                            found.update(search_in_text(content))
+                        # Для текстовых файлов читаем напрямую
+                        if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
+                            with z.open(file) as f:
+                                content = f.read().decode('utf-8', errors='ignore')
+                                found.update(search_in_text(content))
+                        # Для изображений и других бинарных файлов извлекаем во временную директорию
+                        else:
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                z.extract(file, temp_dir)
+                                extracted_file = os.path.join(temp_dir, file)
+                                if os.path.isfile(extracted_file):
+                                    # Обрабатываем изображения
+                                    if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')):
+                                        found.update(search_in_image(extracted_file, config))
+                                    # Обрабатываем PDF
+                                    elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
+                                        found.update(search_in_pdf(extracted_file, config))
+                                    # Обрабатываем DOCX
+                                    elif file.lower().endswith('.docx') and config.get('has_docx', False):
+                                        found.update(search_in_docx(extracted_file, config))
+                                    # Обрабатываем Excel
+                                    elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                        found.update(search_in_excel(extracted_file))
+
     except Exception as e:
         logging.error(f"Ошибка обработки архива {archive_path}: {e}")
     return found
@@ -217,19 +281,37 @@ def process_file(file_path: str, extensions: List[str], max_file_size: int, conf
 
         # Обработка в зависимости от типа файла
         if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'):
-            # Проверяем доступность OCR через глобальную переменную
-            if 'HAS_OCR' in globals() and globals()['HAS_OCR']:
+            # Проверяем доступность OCR через конфиг
+            if config.get('has_ocr', False):
                 found = search_in_image(file_path, config)
             else:
                 logging.info(f"Пропуск изображения {file_path} (OCR недоступен)")
         elif ext == '.pdf':
-            found = search_in_pdf(file_path, config)
+            # Проверяем доступность обработки PDF
+            if config.get('has_pdf', False):
+                found = search_in_pdf(file_path, config)
+            else:
+                logging.info(f"Пропуск PDF {file_path} (обработка PDF недоступна)")
         elif ext == '.docx':
-            found = search_in_docx(file_path, config)
+            # Проверяем доступность обработки DOCX
+            if config.get('has_docx', False):
+                found = search_in_docx(file_path, config)
+            else:
+                logging.info(f"Пропуск DOCX {file_path} (обработка DOCX недоступна)")
         elif ext in ('.xls', '.xlsx'):
-            found = search_in_excel(file_path)
+            # Проверяем доступность обработки Excel
+            if config.get('has_excel', False):
+                found = search_in_excel(file_path)
+            else:
+                logging.info(f"Пропуск Excel {file_path} (обработка Excel недоступна)")
         elif ext in ('.zip', '.7z', '.rar'):
-            found = search_in_archive(file_path, extensions)
+            # Для архивов проверяем доступность соответствующих модулей
+            if ext == '.7z' and not config.get('has_7z', False):
+                logging.info(f"Пропуск 7Z {file_path} (обработка 7Z недоступна)")
+            elif ext == '.rar' and not config.get('has_rar', False):
+                logging.info(f"Пропуск RAR {file_path} (обработка RAR недоступна)")
+            else:
+                found = search_in_archive(file_path, extensions, config)  # Передаем config
         else:
             # Обработка текстовых файлов
             try:

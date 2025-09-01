@@ -7,6 +7,8 @@ import configparser
 from PIL import Image, ImageTk
 import logging
 
+from main import check_dependencies
+
 # Добавляем путь к текущей директории для импорта модулей
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -291,6 +293,9 @@ class SearchApp:
             self.start_search()
 
     def start_search(self):
+
+        check_dependencies()
+
         # Проверяем введенные данные
         if not self.directories:
             messagebox.showerror("Ошибка", "Выберите хотя бы одну директорию для поиска")
