@@ -2,16 +2,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import os
-import sys
 import logging
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
-from logging_setup import setup_logging
 from file_processing import load_keywords
 from search_engine import search_files
 from configparser import ConfigParser
-from PIL import Image, ImageTk
-import time
+
 import fnmatch
 
 # Глобальные флаги для доступности функций
@@ -237,7 +234,7 @@ class SearchApp:
         self.start_button = ttk.Button(button_frame, text="Начать поиск", command=self.start_search)
         self.start_button.pack(side=tk.LEFT, padx=5)
 
-        self.stop_button = ttk.Button(button_frame, text="Остановить", command=self.stop_search, state=tk.DISABLED)
+        self.stop_button = ttk.Button(button_frame, text="Закончить поиск", command=self.stop_search, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(button_frame, text="Сохранить результаты", command=self.save_results).pack(side=tk.LEFT, padx=5)
@@ -307,21 +304,36 @@ class SearchApp:
         self.progress_value.set(0)
         self.current_file.set("")
         self.processed_files = 0
-        self.total_files = 0
 
     def update_progress(self, file_name=""):
-        """Обновление прогресса"""
+        """Обновление прогресса с информацией о прогрессе"""
+        logging.debug(f"Updating progress: {self.processed_files}/{self.total_files}, file: {file_name}")
+
         if self.total_files > 0:
             progress = (self.processed_files / self.total_files) * 100
             self.progress_value.set(progress)
-            # Принудительно обновляем прогрессбар
-            self.progress_bar.update()
-        if file_name:
-            # Обрезаем длинное имя файла для отображения
-            display_name = file_name
-            if len(file_name) > 50:
-                display_name = "..." + file_name[-47:]
-            self.current_file.set(f"Обрабатывается: {display_name}")
+
+            # Обновляем текст с информацией о прогрессе
+            if file_name:
+                # Обрезаем длинное имя файла для отображения
+                display_name = file_name
+                if len(file_name) > 50:
+                    display_name = "..." + file_name[-47:]
+
+                progress_text = f"Обработано: {self.processed_files}/{self.total_files} файлов"
+
+                # Различаем разные типы сообщений
+                if file_name.startswith("Завершена обработка:"):
+                    progress_text += f" | {file_name}"
+                elif file_name == "Поиск завершен":
+                    progress_text = "Поиск завершен! Обработано всех файлов."
+                else:
+                    progress_text += f" | Текущий: {display_name}"
+
+                self.current_file.set(progress_text)
+
+        # Принудительно обновляем прогрессбар
+        self.progress_bar.update_idletasks()
 
     def add_result(self, result_text):
         """Добавление результата в текстовое поле"""
@@ -380,8 +392,11 @@ class SearchApp:
             messagebox.showerror("Ошибка", "Не выбрано ни одной директории для поиска!")
             return
 
-        # Подсчитываем общее количество файлов для прогресса
+        # Сбрасываем счетчики
+        self.processed_files = 0
         self.total_files = 0
+
+        # Подсчитываем общее количество файлов для прогресса
         for directory in self.directories_list:
             self.total_files += self.count_files_to_process(directory, extensions)
 
@@ -426,7 +441,10 @@ class SearchApp:
         self.processed_files = 0
 
         # Запускаем поиск в отдельном потоке
-        self.search_thread = threading.Thread(target=self.run_search, args=(extensions,))
+        self.search_thread = threading.Thread(
+            target=self.run_search,
+            args=(extensions, self.update_progress_callback)  # Передаем callback
+        )
         self.search_thread.daemon = True
         self.search_thread.start()
 
@@ -438,39 +456,64 @@ class SearchApp:
             self.stop_button.config(state=tk.DISABLED)
             logging.info("Поиск остановлен пользователем")
 
-    def run_search(self, extensions):
+            # Принудительно обновляем статус
+            self.current_file.set("Поиск остановлен пользователем")
+
+    def run_search(self, extensions, progress_callback):
         """Выполнение поиска"""
         try:
-            # Выполняем поиск для каждой директории
+            # Сбрасываем только processed_files при начале нового поиска
+            self.processed_files = 0
+            logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
+
+            # Выполняем поиск для каждой директории с накоплением счетчика
             for directory in self.directories_list:
                 if not self.is_searching:
+                    logging.info("Поиск остановлен пользователем")
                     break
 
                 logging.info(f"Начинаем поиск в директории: {directory}")
 
+                # Обновляем статус - начало обработки директории
+                self.root.after(0, lambda: self.update_progress(f"Начата обработка: {os.path.basename(directory)}"))
+
                 # Используем модифицированную функцию поиска с прогрессом
-                results = self.search_files_with_progress(
+                results = search_files(
                     directory,
                     extensions,
                     int(self.threads_var.get()),
                     "search_results.txt",
                     int(self.max_size_var.get()),
-                    self.config['config']
+                    self.config['config'],
+                    progress_callback,
+                    self.processed_files  # Передаем текущее значение как offset
                 )
 
+                # Показываем результаты для текущей директории
                 if results:
-                    logging.info(f"Найдено совпадений в {len(results)} файлах:")
+                    logging.info(f"Найдено совпадений в {len(results)} файлах в директории {directory}:")
                     for file_path, keywords in results.items():
                         result_text = f"Файл: {file_path}\nКлючевые слова: {', '.join(keywords)}\n"
                         logging.info(f"Файл: {file_path}")
                         logging.info(f"Ключевые слова: {', '.join(keywords)}")
                         self.add_result(result_text)
                 else:
-                    logging.info("Ничего не найдено.")
+                    logging.info(f"В директории {directory} ничего не найдено.")
 
+                # Обновляем счетчик обработанных файлов для этой директории
+                files_in_dir = self.count_files_to_process(directory, extensions)
+                logging.info(f"Обработано файлов в директории {directory}: {files_in_dir}")
+
+                # Обновляем прогресс после обработки каждой директории
+                # Используем другое сообщение, не "Поиск завершен"
+                if self.is_searching:
+                    self.root.after(0,
+                                    lambda: self.update_progress(f"Завершена обработка: {os.path.basename(directory)}"))
+
+            # Только после ВСЕХ директорий показываем завершение поиска
             if self.is_searching:
                 logging.info("Поиск завершен!")
-                self.update_progress("Поиск завершен")
+                self.root.after(0, lambda: self.update_progress("Поиск завершен"))
 
         except Exception as e:
             logging.error(f"Ошибка при поиске: {e}")
@@ -479,56 +522,21 @@ class SearchApp:
             self.is_searching = False
             self.root.after(0, self.on_search_finished)
 
-    def search_files_with_progress(self, root_dir, extensions, max_workers=4, output_file=None, max_file_size=10,
-                                   config=None):
-        """Модифицированная версия search_files с обновлением прогресса"""
-        results = {}
+    def update_progress_callback(self, file_name, processed_count):
+        """Callback для обновления прогресса из search_engine"""
+        # Обновляем в основном потоке через after
+        self.root.after(0, lambda: self._update_progress_in_main_thread(file_name, processed_count))
 
-        # Собираем все файлы для обработки
-        files_to_process = []
-        for root, _, files in os.walk(root_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                    files_to_process.append(file_path)
-
-        logging.info(f"Найдено файлов для обработки: {len(files_to_process)}")
-
-        # Импортируем здесь, чтобы избежать циклических импортов
-        from file_processing import process_file
-
-        # Обрабатываем файлы
-        for i, file_path in enumerate(files_to_process):
-            if not self.is_searching:
-                break
-
-            # Обновляем прогресс после КАЖДОГО файла
-            self.processed_files += 1
-            self.root.after(0, lambda f=file_path: self.update_progress(f))  # Вызов в главном потоке
-
-            try:
-                result = process_file(file_path, extensions, max_file_size, config)
-                if result:
-                    results.update(result)
-
-                    # Записываем результат в файл
-                    if output_file:
-                        with open(output_file, 'a', encoding='utf-8') as f:
-                            for path, keywords_found in result.items():
-                                f.write(f"Файл: {path}\n")
-                                f.write(f"Найденные ключевые слова: {', '.join(keywords_found)}\n\n")
-            except Exception as e:
-                logging.error(f"Ошибка при обработке файла {file_path}: {e}")
-
-            # Небольшая задержка для плавного обновления UI
-            time.sleep(0.01)
-
-        return results
+    def _update_progress_in_main_thread(self, file_name, processed_count):
+        """Обновление прогресса в основном потоке"""
+        self.processed_files = processed_count
+        self.update_progress(file_name)
 
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        # Не обновляем прогресс здесь, он уже обновлен в run_search
 
     def update_config(self):
         """Обновление конфигурации"""
