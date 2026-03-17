@@ -138,9 +138,10 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
     found = set()
     try:
         with fitz.open(pdf_path) as doc:
-            max_pages = config.get('max_pdf_pages')
+            max_pages = int(config.get('max_pdf_pages', 0) or 0)
             for page_index, page in enumerate(doc):
-                if max_pages is not None and page_index >= max_pages:
+                # 0 означает "без ограничения"
+                if max_pages > 0 and page_index >= max_pages:
                     logging.info(
                         f"Пропуск оставшихся страниц PDF {pdf_path} (достигнут лимит {max_pages} страниц)"
                     )

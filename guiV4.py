@@ -147,8 +147,8 @@ class SearchApp:
         # Configure grid weights
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(1, weight=1)
-        main_frame.rowconfigure(6, weight=1)
         main_frame.rowconfigure(7, weight=1)
+        main_frame.rowconfigure(8, weight=1)
 
         # Row 0: Extensions selection
         ttk.Label(main_frame, text="Расширения файлов:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -219,20 +219,47 @@ class SearchApp:
         ttk.Checkbutton(options_frame, text="Поиск по изображениям (OCR)",
                         variable=self.search_images_var).pack(side=tk.LEFT)
 
-        # Row 4: Progress
-        ttk.Label(main_frame, text="Прогресс:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        # Row 4: Advanced options
+        ttk.Label(main_frame, text="Доп. настройки:").grid(row=4, column=0, sticky=tk.W, pady=5)
+
+        advanced_options_frame = ttk.Frame(main_frame)
+        advanced_options_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=5)
+
+        ttk.Label(advanced_options_frame, text="Макс. размер изображения (МБ):").pack(side=tk.LEFT, padx=(0, 5))
+        self.max_image_size_var = tk.StringVar(value=str(self.config['config'].get('max_image_size_mb', 10)))
+        max_image_size_spin = ttk.Spinbox(
+            advanced_options_frame, from_=1, to=500, textvariable=self.max_image_size_var, width=6
+        )
+        max_image_size_spin.pack(side=tk.LEFT, padx=(0, 20))
+
+        ttk.Label(advanced_options_frame, text="Макс. страниц PDF (0=без лимита):").pack(side=tk.LEFT, padx=(0, 5))
+        self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
+        max_pdf_pages_spin = ttk.Spinbox(
+            advanced_options_frame, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=8
+        )
+        max_pdf_pages_spin.pack(side=tk.LEFT, padx=(0, 20))
+
+        ttk.Label(advanced_options_frame, text="Макс. строк Excel (0=без лимита):").pack(side=tk.LEFT, padx=(0, 5))
+        self.max_excel_rows_var = tk.StringVar(value=str(self.config['config'].get('max_excel_rows_per_sheet', 0)))
+        max_excel_rows_spin = ttk.Spinbox(
+            advanced_options_frame, from_=0, to=1000000, textvariable=self.max_excel_rows_var, width=8
+        )
+        max_excel_rows_spin.pack(side=tk.LEFT)
+
+        # Row 5: Progress
+        ttk.Label(main_frame, text="Прогресс:").grid(row=5, column=0, sticky=tk.W, pady=5)
 
         progress_frame = ttk.Frame(main_frame)
-        progress_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=5)
+        progress_frame.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=5)
 
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_value, maximum=100)
         self.progress_bar.pack(fill=tk.X, expand=True)
 
         ttk.Label(progress_frame, textvariable=self.current_file).pack(fill=tk.X)
 
-        # Row 5: Buttons
+        # Row 6: Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=5, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=6, column=0, columnspan=2, pady=10)
 
         self.start_button = ttk.Button(button_frame, text="Начать поиск", command=self.start_search)
         self.start_button.pack(side=tk.LEFT, padx=5)
@@ -243,21 +270,21 @@ class SearchApp:
         ttk.Button(button_frame, text="Сохранить результаты", command=self.save_results).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Очистить всё", command=self.clear_all).pack(side=tk.LEFT, padx=5)
 
-        # Row 6: Results
-        ttk.Label(main_frame, text="Результаты поиска:").grid(row=6, column=0, sticky=tk.NW, pady=5)
+        # Row 7: Results
+        ttk.Label(main_frame, text="Результаты поиска:").grid(row=7, column=0, sticky=tk.NW, pady=5)
 
         results_frame = ttk.Frame(main_frame)
-        results_frame.grid(row=6, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        results_frame.grid(row=7, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
         self.results_text = scrolledtext.ScrolledText(results_frame, height=10)
         self.results_text.pack(fill=tk.BOTH, expand=True)
         self.results_text.configure(state='disabled')
 
-        # Row 7: Log
-        ttk.Label(main_frame, text="Лог выполнения:").grid(row=7, column=0, sticky=tk.NW, pady=5)
+        # Row 8: Log
+        ttk.Label(main_frame, text="Лог выполнения:").grid(row=8, column=0, sticky=tk.NW, pady=5)
 
         log_frame = ttk.Frame(main_frame)
-        log_frame.grid(row=7, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.grid(row=8, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10)
         self.log_text.pack(fill=tk.BOTH, expand=True)
@@ -594,9 +621,9 @@ class SearchApp:
             'tesseract_languages': current_cfg.get('tesseract_languages', 'rus'),
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
             # Новые параметры для тонкой настройки поиска
-            'max_image_size_mb': str(current_cfg.get('max_image_size_mb', 10)),
-            'max_pdf_pages': str(current_cfg.get('max_pdf_pages', 0)),
-            'max_excel_rows_per_sheet': str(current_cfg.get('max_excel_rows_per_sheet', 0)),
+            'max_image_size_mb': self.max_image_size_var.get(),
+            'max_pdf_pages': self.max_pdf_pages_var.get(),
+            'max_excel_rows_per_sheet': self.max_excel_rows_var.get(),
         }
 
         # Сохраняем конфиг
