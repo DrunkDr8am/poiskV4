@@ -3,6 +3,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import os
 import logging
+import time  # Добавляем импорт модуля time
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -57,6 +58,8 @@ class SearchApp:
         self.current_file = tk.StringVar(value="")
         self.total_files = 0
         self.processed_files = 0
+        self.search_start_time = None  # Время начала поиска
+        self.search_end_time = None  # Время окончания поиска
 
         # Загружаем конфигурацию ДО создания интерфейса
         self.config = self.load_configuration()
@@ -407,6 +410,12 @@ class SearchApp:
         # Очищаем результаты и лог
         self.clear_all()
 
+        # Записываем время начала поиска
+        self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        start_message = f"Поиск начат: {self.search_start_time}"
+        self.add_result(start_message)
+        logging.info(start_message)
+
         # Обновляем конфиг
         self.update_config()
 
@@ -486,7 +495,8 @@ class SearchApp:
                     int(self.max_size_var.get()),
                     self.config['config'],
                     progress_callback,
-                    self.processed_files  # Передаем текущее значение как offset
+                    self.processed_files,  # Передаем текущее значение как offset
+                    lambda: self.is_searching
                 )
 
                 # Показываем результаты для текущей директории
@@ -519,6 +529,29 @@ class SearchApp:
             logging.error(f"Ошибка при поиске: {e}")
 
         finally:
+            # Записываем время окончания поиска
+            self.search_end_time = time.strftime('%Y-%m-%d %H:%M:%S')
+            end_message = f"Поиск завершен: {self.search_end_time}"
+            self.add_result(end_message)
+            logging.info(end_message)
+
+            # Добавляем информацию о продолжительности поиска
+            if self.search_start_time:
+                try:
+                    start_time_obj = time.strptime(self.search_start_time, '%Y-%m-%d %H:%M:%S')
+                    end_time_obj = time.strptime(self.search_end_time, '%Y-%m-%d %H:%M:%S')
+                    start_seconds = time.mktime(start_time_obj)
+                    end_seconds = time.mktime(end_time_obj)
+                    duration = end_seconds - start_seconds
+                    hours = int(duration // 3600)
+                    minutes = int((duration % 3600) // 60)
+                    seconds = int(duration % 60)
+                    duration_message = f"Продолжительность поиска: {hours:02d}:{minutes:02d}:{seconds:02d}"
+                    self.add_result(duration_message)
+                    logging.info(duration_message)
+                except ValueError:
+                    pass
+
             self.is_searching = False
             self.root.after(0, self.on_search_finished)
 
@@ -546,18 +579,24 @@ class SearchApp:
         extensions_str = self.selected_extensions.get()
         extensions = [ext.strip() for ext in extensions_str.split(',') if ext.strip()]
 
+        current_cfg = self.config['config']
+
         # Обновляем конфиг
         config['Settings'] = {
             'extensions': ', '.join(extensions),
-            'keywords_file': 'keywords.txt',
-            'directory': self.directories_list[0] if self.directories_list else '.',
+            'keywords_file': current_cfg.get('keywords_file', 'keywords.txt'),
+            'directory': self.directories_list[0] if self.directories_list else current_cfg.get('directory', '.'),
             'threads': self.threads_var.get(),
-            'output_file': 'search_results.txt',
+            'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
             'max_file_size': self.max_size_var.get(),
-            'log_file': 'search_log.txt',
-            'tesseract_languages': self.config['config'].get('tesseract_languages', 'rus'),
-            'tesseract_config': self.config['config'].get('tesseract_config', '--oem 3 --psm 6')
+            'log_file': current_cfg.get('log_file', 'search_log.txt'),
+            'tesseract_languages': current_cfg.get('tesseract_languages', 'rus'),
+            'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
+            # Новые параметры для тонкой настройки поиска
+            'max_image_size_mb': str(current_cfg.get('max_image_size_mb', 10)),
+            'max_pdf_pages': str(current_cfg.get('max_pdf_pages', 0)),
+            'max_excel_rows_per_sheet': str(current_cfg.get('max_excel_rows_per_sheet', 0)),
         }
 
         # Сохраняем конфиг

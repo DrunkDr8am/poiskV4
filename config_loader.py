@@ -16,7 +16,11 @@ def load_config(config_file="config.txt"):
         'max_file_size': '50',
         'log_file': 'search_log.txt',
         'tesseract_languages': 'rus',
-        'tesseract_config': '--oem 3 --psm 6'
+        'tesseract_config': '--oem 3 --psm 6',
+        # Новые параметры для тонкой настройки
+        'max_image_size_mb': '10',
+        'max_pdf_pages': '0',  # 0 = без ограничения
+        'max_excel_rows_per_sheet': '0',  # 0 = без ограничения
     }
 
     # Если файл конфигурации существует, загружаем его
@@ -38,6 +42,13 @@ def load_config(config_file="config.txt"):
     log_file = config.get('Settings', 'log_file', fallback=defaults['log_file'])
     tesseract_languages = config.get('Settings', 'tesseract_languages', fallback=defaults['tesseract_languages'])
     tesseract_config = config.get('Settings', 'tesseract_config', fallback=defaults['tesseract_config'])
+    max_image_size_mb = config.getint('Settings', 'max_image_size_mb', fallback=int(defaults['max_image_size_mb']))
+    max_pdf_pages = config.getint('Settings', 'max_pdf_pages', fallback=int(defaults['max_pdf_pages']))
+    max_excel_rows_per_sheet = config.getint(
+        'Settings',
+        'max_excel_rows_per_sheet',
+        fallback=int(defaults['max_excel_rows_per_sheet']),
+    )
 
     # Очищаем значения от пробелов
     extensions = [ext.strip() for ext in extensions]
@@ -61,7 +72,10 @@ def load_config(config_file="config.txt"):
         'max_file_size': max_file_size,
         'log_file': log_file,
         'tesseract_languages': tesseract_languages,
-        'tesseract_config': tesseract_config
+        'tesseract_config': tesseract_config,
+        'max_image_size_mb': max_image_size_mb,
+        'max_pdf_pages': max_pdf_pages,
+        'max_excel_rows_per_sheet': max_excel_rows_per_sheet,
     }
 
 def create_default_config():
@@ -94,6 +108,15 @@ log_file = search_log.txt
 # Настройки Tesseract OCR
 tesseract_languages = rus
 tesseract_config = --oem 3 --psm 6
+
+# Максимальный размер изображения для OCR (МБ)
+max_image_size_mb = 10
+
+# Максимальное количество страниц PDF для анализа (0 = без ограничения)
+max_pdf_pages = 0
+
+# Максимальное количество строк Excel на лист (0 = без ограничения)
+max_excel_rows_per_sheet = 0
 """
 
     with open("config.txt", "w", encoding="utf-8") as f:
