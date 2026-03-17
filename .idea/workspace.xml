@@ -4,13 +4,14 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment=".">
+    <list default="true" id="85e98d0d-b002-4759-97b7-eec1f55f4f50" name="Changes" comment="оно работает. даже красиво">
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Checkout_at_01_09_2025_17_03_[Changes]/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Checkout_at_01_09_2025_17_03__Changes_.xml" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/gui.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/guiV2.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/guiV3.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/config_loader.py" beforeDir="false" afterPath="$PROJECT_DIR$/config_loader.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/file_processing.py" beforeDir="false" afterPath="$PROJECT_DIR$/file_processing.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/guiV4.py" beforeDir="false" afterPath="$PROJECT_DIR$/guiV4.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/poiskV4.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/search_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/search_engine.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -50,33 +51,34 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.PoiskV4.executor": "Run",
-    "Python.gui.executor": "Run",
-    "Python.guiV2.executor": "Run",
-    "Python.guiV3.executor": "Run",
-    "Python.guiV4.executor": "Run",
-    "Python.main.executor": "Run",
-    "Python.poisk.executor": "Run",
-    "Python.poisk2.executor": "Run",
-    "Python.poisk3.executor": "Run",
-    "Python.poiskV2.executor": "Run",
-    "Python.poiskV3.executor": "Run",
-    "Python.poiskV4 (1).executor": "Run",
-    "Python.script.executor": "Run",
-    "Python.scriptTry.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "git-widget-placeholder": "master",
-    "last_opened_file_path": "C:/Users/Leonova.2P2178/PyCharmMiscProject/test/test"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.PoiskV4.executor&quot;: &quot;Run&quot;,
+    &quot;Python.gui.executor&quot;: &quot;Run&quot;,
+    &quot;Python.guiV2.executor&quot;: &quot;Run&quot;,
+    &quot;Python.guiV3.executor&quot;: &quot;Run&quot;,
+    &quot;Python.guiV4.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poisk.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poisk2.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poisk3.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poiskV2.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poiskV3.executor&quot;: &quot;Run&quot;,
+    &quot;Python.poiskV4 (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.script.executor&quot;: &quot;Run&quot;,
+    &quot;Python.scriptTry.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/Leonova.2P2178/PyCharmMiscProject/dist&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\Leonova.2P2178\PyCharmMiscProject\dist" />
       <recent name="C:\Users\Leonova.2P2178\PyCharmMiscProject\test\test" />
       <recent name="C:\Users\Leonova.2P2178\PyCharmMiscProject" />
       <recent name="C:\Users\Leonova.2P2178\PyCharmMiscProject\dist\poiskV4" />
@@ -324,7 +326,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756810285243</updated>
     </task>
-    <option name="localTasksCounter" value="11" />
+    <task id="LOCAL-00011" summary="оно работает. даже красиво">
+      <option name="closed" value="true" />
+      <created>1756986345173</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1756986345173</updated>
+    </task>
+    <option name="localTasksCounter" value="12" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -346,6 +356,7 @@
     <MESSAGE value="main работает, а gui пока нет до конца." />
     <MESSAGE value="все работает, но нужно доработать интерфейс и сохранение." />
     <MESSAGE value="." />
-    <option name="LAST_COMMIT_MESSAGE" value="." />
+    <MESSAGE value="оно работает. даже красиво" />
+    <option name="LAST_COMMIT_MESSAGE" value="оно работает. даже красиво" />
   </component>
 </project>
