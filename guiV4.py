@@ -4,6 +4,8 @@ import threading
 import os
 import logging
 import time  # Добавляем импорт модуля time
+import subprocess
+import sys
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -19,27 +21,6 @@ HAS_EXCEL = False
 HAS_7Z = False
 HAS_RAR = False
 HAS_OCR = False
-
-
-class TextHandler(logging.Handler):
-    """Кастомный обработчик для логирования в текстовое поле"""
-
-    def __init__(self, text_widget):
-        super().__init__()
-        self.text_widget = text_widget
-        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-    def emit(self, record):
-        msg = self.format(record)
-
-        def append():
-            self.text_widget.configure(state='normal')
-            self.text_widget.insert(tk.END, msg + '\n')
-            self.text_widget.see(tk.END)
-            self.text_widget.configure(state='disabled')
-
-        # Вызываем в основном потоке
-        self.text_widget.after(0, append)
 
 
 class SearchApp:
@@ -152,7 +133,6 @@ class SearchApp:
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(1, weight=1)
         main_frame.rowconfigure(7, weight=1)
-        main_frame.rowconfigure(8, weight=1)
 
         # Row 0: Extensions selection
         ttk.Label(main_frame, text="Расширения файлов:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -284,35 +264,42 @@ class SearchApp:
 
         results_frame = ttk.Frame(main_frame)
         results_frame.grid(row=7, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
 
-        self.results_text = scrolledtext.ScrolledText(results_frame, height=10)
-        self.results_text.pack(fill=tk.BOTH, expand=True)
-        self.results_text.configure(state='disabled')
+        self.results_table = ttk.Treeview(
+            results_frame,
+            columns=("keywords", "file"),
+            show="headings",
+            height=10
+        )
+        self.results_table.heading("keywords", text="Найденные слова")
+        self.results_table.heading("file", text="Ссылка на файл")
+        # Фиксированная ширина колонок (без растягивания)
+        self.results_table.column("keywords", width=320, minwidth=320, stretch=False, anchor=tk.W)
+        self.results_table.column("file", width=620, minwidth=620, stretch=False, anchor=tk.W)
 
-        # Row 8: Log
-        ttk.Label(main_frame, text="Лог выполнения:").grid(row=8, column=0, sticky=tk.NW, pady=5)
+        results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_table.yview)
+        self.results_table.configure(yscrollcommand=results_scrollbar.set)
 
-        log_frame = ttk.Frame(main_frame)
-        log_frame.grid(row=8, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.results_table.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        results_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.configure(state='disabled')
+        self.results_table.tag_configure('hover', background='#eaf3ff')
+        self.hovered_result_item = None
+        self.results_table.bind("<Double-Button-1>", self.open_result_file)
+        self.results_table.bind("<Motion>", self.on_results_hover)
+        self.results_table.bind("<Leave>", self.on_results_leave)
 
-        # Настраиваем логирование в текстовое поле
+        # Настраиваем базовое логирование приложения
         self.setup_logging()
 
     def setup_logging(self):
-        """Настройка логирования в текстовое поле"""
+        """Настройка базового логирования приложения"""
         # Очищаем существующие обработчики
         logger = logging.getLogger()
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
-
-        # Добавляем обработчик для текстового поля
-        log_handler = TextHandler(self.log_text)
-        log_handler.setLevel(logging.INFO)
-        logger.addHandler(log_handler)
         logger.setLevel(logging.INFO)
 
     def add_directory(self):
@@ -332,13 +319,9 @@ class SearchApp:
 
     def clear_all(self):
         """Очистка всех полей"""
-        self.log_text.configure(state='normal')
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.configure(state='disabled')
-
-        self.results_text.configure(state='normal')
-        self.results_text.delete(1.0, tk.END)
-        self.results_text.configure(state='disabled')
+        for item in self.results_table.get_children():
+            self.results_table.delete(item)
+        self.hovered_result_item = None
 
         self.progress_value.set(0)
         self.current_file.set("")
@@ -374,16 +357,54 @@ class SearchApp:
         # Принудительно обновляем прогрессбар
         self.progress_bar.update_idletasks()
 
-    def add_result(self, result_text):
-        """Добавление результата в текстовое поле"""
+    def add_live_result(self, file_path, keywords):
+        """Добавление найденного результата в таблицу в реальном времени."""
+        keywords_str = ', '.join(sorted(keywords)) if keywords else ''
+        self.root.after(0, lambda: self.results_table.insert('', tk.END, values=(keywords_str, file_path)))
 
-        def append_result():
-            self.results_text.configure(state='normal')
-            self.results_text.insert(tk.END, result_text + '\n')
-            self.results_text.see(tk.END)
-            self.results_text.configure(state='disabled')
+    def open_result_file(self, event):
+        """Открытие файла из выбранной строки таблицы по двойному клику."""
+        try:
+            item_id = self.results_table.identify_row(event.y)
+            if not item_id:
+                return
 
-        self.root.after(0, append_result)
+            values = self.results_table.item(item_id, "values")
+            if not values or len(values) < 2:
+                return
+
+            file_path = str(values[1]).strip()
+            if not file_path or not os.path.exists(file_path):
+                messagebox.showwarning("Файл не найден", f"Файл не существует:\n{file_path}")
+                return
+
+            if hasattr(os, "startfile"):
+                os.startfile(file_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", file_path])
+            else:
+                subprocess.Popen(["xdg-open", file_path])
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+
+    def on_results_hover(self, event):
+        """Подсветка строки таблицы при наведении."""
+        item_id = self.results_table.identify_row(event.y)
+        if item_id == self.hovered_result_item:
+            return
+
+        if self.hovered_result_item:
+            self.results_table.item(self.hovered_result_item, tags=())
+
+        self.hovered_result_item = item_id if item_id else None
+        if self.hovered_result_item:
+            self.results_table.item(self.hovered_result_item, tags=('hover',))
+
+    def on_results_leave(self, _event):
+        """Сброс подсветки строки, когда курсор покинул таблицу."""
+        if self.hovered_result_item:
+            self.results_table.item(self.hovered_result_item, tags=())
+            self.hovered_result_item = None
 
     def count_files_to_process(self, directory, extensions):
         """Подсчет общего количества файлов для обработки"""
@@ -448,7 +469,6 @@ class SearchApp:
         # Записываем время начала поиска
         self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
         start_message = f"Поиск начат: {self.search_start_time}"
-        self.add_result(start_message)
         logging.info(start_message)
 
         # Обновляем конфиг
@@ -531,17 +551,16 @@ class SearchApp:
                     self.config['config'],
                     progress_callback,
                     self.processed_files,  # Передаем текущее значение как offset
-                    lambda: self.is_searching
+                    lambda: self.is_searching,
+                    self.add_live_result
                 )
 
                 # Показываем результаты для текущей директории
                 if results:
                     logging.info(f"Найдено совпадений в {len(results)} файлах в директории {directory}:")
                     for file_path, keywords in results.items():
-                        result_text = f"Файл: {file_path}\nКлючевые слова: {', '.join(keywords)}\n"
                         logging.info(f"Файл: {file_path}")
                         logging.info(f"Ключевые слова: {', '.join(keywords)}")
-                        self.add_result(result_text)
                 else:
                     logging.info(f"В директории {directory} ничего не найдено.")
 
@@ -567,7 +586,6 @@ class SearchApp:
             # Записываем время окончания поиска
             self.search_end_time = time.strftime('%Y-%m-%d %H:%M:%S')
             end_message = f"Поиск завершен: {self.search_end_time}"
-            self.add_result(end_message)
             logging.info(end_message)
 
             # Добавляем информацию о продолжительности поиска
@@ -582,7 +600,6 @@ class SearchApp:
                     minutes = int((duration % 3600) // 60)
                     seconds = int(duration % 60)
                     duration_message = f"Продолжительность поиска: {hours:02d}:{minutes:02d}:{seconds:02d}"
-                    self.add_result(duration_message)
                     logging.info(duration_message)
                 except ValueError:
                     pass
@@ -647,13 +664,12 @@ class SearchApp:
         )
         if filename:
             try:
-                # Сохраняем результаты из текстового поля
-                self.results_text.configure(state='normal')
-                results_content = self.results_text.get(1.0, tk.END)
-                self.results_text.configure(state='disabled')
-
                 with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(results_content)
+                    f.write("Результаты поиска:\n\n")
+                    for item_id in self.results_table.get_children():
+                        keywords, file_path = self.results_table.item(item_id, "values")
+                        f.write(f"Найденные слова: {keywords}\n")
+                        f.write(f"Файл: {file_path}\n\n")
                 messagebox.showinfo("Успех", "Результаты сохранены!")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось сохранить результаты: {e}")
