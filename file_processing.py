@@ -114,7 +114,14 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
     try:
         img = Image.open(image_data) if isinstance(image_data, BytesIO) else Image.open(image_data)
 
-        if img.mode not in ('RGB', 'L'):
+        # Для палитровых изображений с прозрачностью сначала переводим в RGBA,
+        # чтобы избежать предупреждения Pillow и корректно обработать альфа-канал.
+        if img.mode == 'P' and 'transparency' in img.info:
+            img = img.convert('RGBA')
+
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+        elif img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
 
         # Используем настройки из конфига

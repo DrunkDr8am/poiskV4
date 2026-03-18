@@ -11,7 +11,8 @@ from file_processing import process_file  # Импортируем функци�
 
 def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, output_file: str = None,
                  max_file_size: int = 10, config: dict = None, progress_callback: callable = None,
-                 start_count: int = 0, is_searching_func: callable = None) -> Dict[str, Set[str]]:
+                 start_count: int = 0, is_searching_func: callable = None,
+                 result_callback: callable = None) -> Dict[str, Set[str]]:
     """Многопоточный поиск файлов с поддержкой offset и проверкой флага остановки"""
     results: Dict[str, Set[str]] = {}
 
@@ -73,6 +74,12 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 result = future.result(timeout=300)
                 if result:
                     results.update(result)
+                    if result_callback and callable(result_callback):
+                        try:
+                            for path, keywords_found in result.items():
+                                result_callback(path, keywords_found)
+                        except Exception as e:
+                            logging.error(f"Ошибка в callback результата: {e}")
                     if output_handle:
                         for path, keywords_found in result.items():
                             output_handle.write(f"Файл: {path}\n")
