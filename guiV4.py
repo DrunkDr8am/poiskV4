@@ -35,6 +35,7 @@ class SearchApp:
         self.extension_vars = {ext: tk.BooleanVar(value=False) for ext in self.extension_options}
         self.directories_list = []
         self.is_searching = False
+        self.is_paused = False
         self.search_thread = None
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
@@ -253,6 +254,9 @@ class SearchApp:
         self.start_button = ttk.Button(button_frame, text="Начать поиск", command=self.start_search)
         self.start_button.pack(side=tk.LEFT, padx=5)
 
+        self.pause_button = ttk.Button(button_frame, text="Пауза", command=self.toggle_pause, state=tk.DISABLED)
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+
         self.stop_button = ttk.Button(button_frame, text="Закончить поиск", command=self.stop_search, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
 
@@ -347,10 +351,12 @@ class SearchApp:
                 # Различаем разные типы сообщений
                 if file_name.startswith("Завершена обработка:"):
                     progress_text += f" | {file_name}"
+                elif file_name.startswith("Начат:"):
+                    progress_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
                 elif file_name == "Поиск завершен":
                     progress_text = "Поиск завершен! Обработано всех файлов."
                 else:
-                    progress_text += f" | Текущий: {display_name}"
+                    progress_text += f" | {display_name}"
 
                 self.current_file.set(progress_text)
 
@@ -500,8 +506,10 @@ class SearchApp:
 
         # Меняем состояние кнопок
         self.start_button.config(state=tk.DISABLED)
+        self.pause_button.config(state=tk.NORMAL, text="Пауза")
         self.stop_button.config(state=tk.NORMAL)
         self.is_searching = True
+        self.is_paused = False
         self.processed_files = 0
 
         # Запускаем поиск в отдельном потоке
@@ -516,12 +524,29 @@ class SearchApp:
         """Остановка поиска"""
         if self.is_searching:
             self.is_searching = False
-            self.start_button.config(state=tk.NORMAL)
+            self.is_paused = False
+            # Не включаем "Старт" до полного завершения фонового потока
+            self.start_button.config(state=tk.DISABLED)
+            self.pause_button.config(state=tk.DISABLED, text="Пауза")
             self.stop_button.config(state=tk.DISABLED)
-            logging.info("Поиск остановлен пользователем")
+            logging.info("Запрошена остановка поиска пользователем")
 
-            # Принудительно обновляем статус
-            self.current_file.set("Поиск остановлен пользователем")
+            # Обновляем статус: процесс еще завершает текущие задачи
+            self.current_file.set("Останавливаем поиск...")
+
+    def toggle_pause(self):
+        """Пауза/продолжение поиска."""
+        if not self.is_searching:
+            return
+
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.pause_button.config(text="Продолжить")
+            self.current_file.set("Поиск на паузе")
+            logging.info("Поиск поставлен на паузу")
+        else:
+            self.pause_button.config(text="Пауза")
+            logging.info("Поиск продолжен")
 
     def run_search(self, extensions, progress_callback):
         """Выполнение поиска"""
@@ -552,7 +577,8 @@ class SearchApp:
                     progress_callback,
                     self.processed_files,  # Передаем текущее значение как offset
                     lambda: self.is_searching,
-                    self.add_live_result
+                    self.add_live_result,
+                    lambda: self.is_paused
                 )
 
                 # Показываем результаты для текущей директории
@@ -585,7 +611,10 @@ class SearchApp:
         finally:
             # Записываем время окончания поиска
             self.search_end_time = time.strftime('%Y-%m-%d %H:%M:%S')
-            end_message = f"Поиск завершен: {self.search_end_time}"
+            if self.is_searching:
+                end_message = f"Поиск завершен: {self.search_end_time}"
+            else:
+                end_message = f"Поиск остановлен: {self.search_end_time}"
             logging.info(end_message)
 
             # Добавляем информацию о продолжительности поиска
@@ -605,6 +634,7 @@ class SearchApp:
                     pass
 
             self.is_searching = False
+            self.is_paused = False
             self.root.after(0, self.on_search_finished)
 
     def update_progress_callback(self, file_name, processed_count):
@@ -614,14 +644,18 @@ class SearchApp:
 
     def _update_progress_in_main_thread(self, file_name, processed_count):
         """Обновление прогресса в основном потоке"""
-        self.processed_files = processed_count
+        if isinstance(processed_count, int):
+            self.processed_files = processed_count
         self.update_progress(file_name)
 
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
         self.start_button.config(state=tk.NORMAL)
+        self.pause_button.config(state=tk.DISABLED, text="Пауза")
         self.stop_button.config(state=tk.DISABLED)
-        # Не обновляем прогресс здесь, он уже обновлен в run_search
+        # Если остановка была пользователем, финализируем человекочитаемый статус
+        if self.current_file.get() == "Останавливаем поиск...":
+            self.current_file.set("Поиск остановлен пользователем")
 
     def update_config(self):
         """Обновление конфигурации"""
