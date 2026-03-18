@@ -50,7 +50,8 @@ class SearchApp:
         self.root.minsize(900, 700)
 
         # Переменные для хранения состояний
-        self.selected_extensions = tk.StringVar()
+        self.extension_options = ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z']
+        self.extension_vars = {ext: tk.BooleanVar(value=False) for ext in self.extension_options}
         self.directories_list = []
         self.is_searching = False
         self.search_thread = None
@@ -87,17 +88,20 @@ class SearchApp:
             create_default_config()
 
         config = load_config()
+        selected_extensions = [ext.strip() for ext in config.get('extensions', []) if ext.strip()]
+        selected_set = set(selected_extensions)
 
-        # Устанавливаем значение для текстового поле расширений
-        extensions_str = ', '.join(config['extensions'])
-        if not hasattr(self, 'selected_extensions'):
-            self.selected_extensions = tk.StringVar(value=extensions_str)
-        else:
-            self.selected_extensions.set(extensions_str)
+        # Сохраняем пользовательские расширения из конфига и показываем их как отдельные чекбоксы
+        for ext in selected_extensions:
+            if ext not in self.extension_vars:
+                self.extension_options.append(ext)
+                self.extension_vars[ext] = tk.BooleanVar(value=False)
+
+        for ext, ext_var in self.extension_vars.items():
+            ext_var.set(ext in selected_set)
 
         return {
-            'config': config,
-            'extensions_str': extensions_str
+            'config': config
         }
 
     def check_dependencies(self):
@@ -154,10 +158,15 @@ class SearchApp:
         ttk.Label(main_frame, text="Расширения файлов:").grid(row=0, column=0, sticky=tk.W, pady=5)
         extensions_frame = ttk.Frame(main_frame)
         extensions_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
-
-        self.extensions_entry = ttk.Entry(extensions_frame, textvariable=self.selected_extensions, width=50)
-        self.extensions_entry.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        extensions_frame.columnconfigure(0, weight=1)
+        columns = 5
+        for index, ext in enumerate(self.extension_options):
+            row = index // columns
+            col = index % columns
+            ttk.Checkbutton(
+                extensions_frame,
+                text=ext,
+                variable=self.extension_vars[ext]
+            ).grid(row=row, column=col, sticky=tk.W, padx=(0, 12), pady=2)
 
         # Row 1: Keywords
         ttk.Label(main_frame, text="Ключевые слова:").grid(row=1, column=0, sticky=tk.NW, pady=5)
@@ -387,17 +396,16 @@ class SearchApp:
                     count += 1
         return count
 
+    def get_selected_extensions(self):
+        """Возвращает список расширений, выбранных галочками."""
+        return [ext for ext in self.extension_options if self.extension_vars[ext].get()]
+
     def start_search(self):
         """Запуск поиска в отдельном потоке"""
         if self.is_searching:
             return
 
-        # Сохраняем текущие значения перед обновлением конфига
-        current_extensions = self.selected_extensions.get()
-
-        # Получаем выбранные расширения из текстового поля
-        extensions_str = current_extensions
-        extensions = [ext.strip() for ext in extensions_str.split(',') if ext.strip()]
+        extensions = self.get_selected_extensions()
 
         if not extensions:
             messagebox.showerror("Ошибка", "Не выбрано ни одного расширения файлов!")
@@ -601,10 +609,7 @@ class SearchApp:
     def update_config(self):
         """Обновление конфигурации"""
         config = ConfigParser()
-
-        # Получаем выбранные расширения из текстового поля
-        extensions_str = self.selected_extensions.get()
-        extensions = [ext.strip() for ext in extensions_str.split(',') if ext.strip()]
+        extensions = self.get_selected_extensions()
 
         current_cfg = self.config['config']
 

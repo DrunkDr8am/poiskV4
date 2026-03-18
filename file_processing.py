@@ -149,6 +149,9 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
                 # Текст со страницы
                 text = page.get_text()
                 found.update(search_in_text(text))
+                if KEYWORDS_LOWER and found.issuperset(KEYWORDS_LOWER):
+                    logging.info(f"Ранний останов PDF {pdf_path} (найдены все ключевые слова)")
+                    return found
 
                 # Обработка изображений (только если есть OCR)
                 for img in page.get_images(full=True):
@@ -157,6 +160,9 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
                     if base_image and "image" in base_image:
                         image_data = BytesIO(base_image["image"])
                         found.update(search_in_image(image_data, config))
+                        if KEYWORDS_LOWER and found.issuperset(KEYWORDS_LOWER):
+                            logging.info(f"Ранний останов PDF {pdf_path} (найдены все ключевые слова)")
+                            return found
     except Exception as e:
         logging.error(f"Ошибка обработки PDF {pdf_path}: {e}")
     return found
