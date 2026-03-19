@@ -39,6 +39,7 @@ class SearchApp:
         self.search_thread = None
         self.is_adding_directory = False
         self.config_dirty = False
+        self._updating_threads_var = False
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
         self.theme_var = tk.StringVar(value="Светлая")
@@ -73,6 +74,46 @@ class SearchApp:
         """Автовыбор потоков: CPU-2, либо 1 при CPU<=2."""
         cpu_count = os.cpu_count() or 1
         return cpu_count - 2 if cpu_count > 2 else 1
+
+    @staticmethod
+    def get_max_threads_count():
+        """Максимально допустимое количество потоков на текущем компьютере."""
+        return max(1, os.cpu_count() or 1)
+
+    def normalize_threads_value(self):
+        """Нормализует количество потоков в диапазон [1, cpu_count]."""
+        max_threads = self.get_max_threads_count()
+        try:
+            threads = int(self.threads_var.get())
+        except (TypeError, ValueError):
+            threads = self.get_auto_threads_count()
+        threads = max(1, min(threads, max_threads))
+        self.threads_var.set(str(threads))
+        return threads
+
+    def on_threads_var_change(self, *_args):
+        """Не дает вручную ввести число потоков больше доступного."""
+        if self._updating_threads_var:
+            return
+
+        value = self.threads_var.get()
+        if value == "":
+            return
+
+        filtered = "".join(ch for ch in value if ch.isdigit())
+        max_threads = self.get_max_threads_count()
+
+        if not filtered:
+            new_value = "1"
+        else:
+            new_value = str(min(max(1, int(filtered)), max_threads))
+
+        if new_value != value:
+            self._updating_threads_var = True
+            try:
+                self.threads_var.set(new_value)
+            finally:
+                self._updating_threads_var = False
 
     def load_configuration(self):
         """Загрузка конфигурации"""
@@ -259,8 +300,9 @@ class SearchApp:
         ttk.Label(settings_tab, text="Потоки:").grid(row=2, column=0, sticky=tk.W, pady=3)
         auto_threads = self.get_auto_threads_count()
         self.threads_var = tk.StringVar(value=str(auto_threads))
+        self.threads_var.trace_add("write", self.on_threads_var_change)
         threads_spin = ttk.Spinbox(
-            settings_tab, from_=1, to=max(16, auto_threads), textvariable=self.threads_var, width=8
+            settings_tab, from_=1, to=self.get_max_threads_count(), textvariable=self.threads_var, width=8
         )
         threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
 
@@ -548,6 +590,7 @@ class SearchApp:
 
         # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
         self.threads_var.set(str(self.get_auto_threads_count()))
+        self.normalize_threads_value()
 
         extensions = self.get_selected_extensions()
 
@@ -670,6 +713,7 @@ class SearchApp:
         try:
             # Сбрасываем только processed_files при начале нового поиска
             self.processed_files = 0
+            threads_count = self.normalize_threads_value()
             logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
 
             # Выполняем поиск для каждой директории с накоплением счетчика
@@ -687,7 +731,7 @@ class SearchApp:
                 results = search_files(
                     directory,
                     extensions,
-                    int(self.threads_var.get()),
+                    threads_count,
                     "search_results.txt",
                     int(self.max_size_var.get()),
                     self.config['config'],
@@ -776,6 +820,7 @@ class SearchApp:
         extensions = self.get_selected_extensions()
 
         current_cfg = self.config['config']
+        threads_count = self.normalize_threads_value()
 
         # Обновляем конфиг
         config['Settings'] = {
@@ -783,7 +828,7 @@ class SearchApp:
             'keywords_file': current_cfg.get('keywords_file', 'keywords.txt'),
             'directories': '; '.join(self.directories_list) if self.directories_list else '.',
             'directory': self.directories_list[0] if self.directories_list else current_cfg.get('directory', '.'),
-            'threads': self.threads_var.get(),
+            'threads': str(threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
             'max_file_size': self.max_size_var.get(),
