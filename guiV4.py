@@ -1,11 +1,13 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+import argparse
 import threading
 import os
 import logging
 import time  # Добавляем импорт модуля time
 import subprocess
 import sys
+import re
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -24,14 +26,40 @@ HAS_OCR = False
 APP_PASSWORD = "2407"
 INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
+AUTO_RUN_INTERVAL_DAYS = 7
+AUTO_RUN_DAILY_TIME = "09:00"
+AUTO_RUN_TASK_NAME_DAILY = "PoiskV4WeeklyCheckDaily"
+AUTO_RUN_STARTUP_FILE_NAME = "PoiskV4WeeklyCheckAutoRun.cmd"
+DEFAULT_RESULTS_FOLDER = "Результаты_проверки"
+
+
+def get_desktop_path():
+    """Возвращает путь к рабочему столу пользователя."""
+    user_home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(user_home, "Desktop"),
+        os.path.join(user_home, "OneDrive", "Desktop"),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[0]
+
+
+def sanitize_filename(name: str) -> str:
+    """Подготавливает имя директории к использованию как имя файла."""
+    cleaned = re.sub(r'[<>:"/\\|?*]+', '_', name or 'directory')
+    cleaned = cleaned.strip(" ._")
+    return cleaned or "directory"
 
 
 class SearchApp:
-    def __init__(self, root):
+    def __init__(self, root, auto_run_mode=False):
         self.root = root
         self.root.title("Поиск файлов по ключевым словам")
         self.root.geometry("1000x800")
         self.root.minsize(900, 700)
+        self.auto_run_mode = auto_run_mode
 
         # Переменные для хранения состояний
         self.extension_options = ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z']
@@ -54,6 +82,10 @@ class SearchApp:
         self.processed_files = 0
         self.search_start_time = None  # Время начала поиска
         self.search_end_time = None  # Время окончания поиска
+        self.current_run_output_dir = None
+        self.completed_run_output_dir = None
+        self.directory_report_paths = {}
+        self.search_completed_successfully = False
 
         # Загружаем конфигурацию ДО создания интерфейса
         self.config = self.load_configuration()
@@ -67,6 +99,7 @@ class SearchApp:
 
         # Центрируем окно
         self.center_window()
+        self.ensure_automatic_run_tasks()
 
     def center_window(self):
         self.root.update_idletasks()
@@ -432,6 +465,258 @@ class SearchApp:
             logger.removeHandler(handler)
         logger.setLevel(logging.INFO)
 
+    def get_results_root_directory(self):
+        """Возвращает корневую папку для отчетов на рабочем столе."""
+        results_folder = self.config['config'].get('results_folder', DEFAULT_RESULTS_FOLDER) or DEFAULT_RESULTS_FOLDER
+        return os.path.join(get_desktop_path(), results_folder)
+
+    def create_dated_results_directory(self):
+        """Создает папку с текущей датой для результатов проверки."""
+        base_directory = self.get_results_root_directory()
+        dated_directory = os.path.join(base_directory, time.strftime("%d-%m-%Y"))
+        os.makedirs(dated_directory, exist_ok=True)
+        return dated_directory
+
+    def get_directory_report_path(self, directory, used_names):
+        """Формирует уникальное имя txt-отчета для директории."""
+        directory_name = os.path.basename(os.path.normpath(directory)) or os.path.normpath(directory)
+        base_name = sanitize_filename(directory_name)
+        candidate = base_name
+        suffix = 2
+
+        while candidate.lower() in used_names:
+            candidate = f"{base_name}_{suffix}"
+            suffix += 1
+
+        used_names.add(candidate.lower())
+        return os.path.join(self.current_run_output_dir, f"{candidate}.txt")
+
+    def get_last_successful_run_timestamp(self):
+        """Возвращает timestamp последней успешной проверки."""
+        last_run_raw = self.config['config'].get('last_successful_run', '').strip()
+        if not last_run_raw:
+            return None
+
+        try:
+            parsed = time.strptime(last_run_raw, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            logging.warning("Не удалось разобрать дату последней проверки: %s", last_run_raw)
+            return None
+
+        return time.mktime(parsed)
+
+    def is_automatic_run_due(self):
+        """Определяет, пора ли запускать еженедельную автоматическую проверку."""
+        last_run_timestamp = self.get_last_successful_run_timestamp()
+        if last_run_timestamp is None:
+            return True
+
+        return (time.time() - last_run_timestamp) >= AUTO_RUN_INTERVAL_DAYS * 24 * 60 * 60
+
+    def save_last_successful_run(self):
+        """Сохраняет дату успешной проверки в конфиг."""
+        self.config['config']['last_successful_run'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        self.update_config(reload_after_save=False)
+
+    def get_auto_run_command(self):
+        """Формирует команду для автозапуска приложения через планировщик."""
+        if getattr(sys, "frozen", False):
+            command_parts = [os.path.abspath(sys.executable), "--auto-run"]
+        else:
+            python_executable = os.path.abspath(sys.executable)
+            if python_executable.lower().endswith("python.exe"):
+                pythonw_executable = python_executable[:-10] + "pythonw.exe"
+                if os.path.exists(pythonw_executable):
+                    python_executable = pythonw_executable
+            command_parts = [python_executable, os.path.abspath(__file__), "--auto-run"]
+
+        return subprocess.list2cmdline(command_parts)
+
+    def create_or_update_scheduled_task(self, task_name, schedule_args):
+        """Создает или обновляет задачу планировщика Windows."""
+        command = [
+            "schtasks",
+            "/Create",
+            "/F",
+            "/TN",
+            task_name,
+            "/TR",
+            self.get_auto_run_command(),
+            "/RL",
+            "LIMITED",
+            *schedule_args,
+        ]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            creationflags=creationflags
+        )
+        if result.returncode != 0:
+            error_text = (result.stderr or result.stdout or "").strip()
+            logging.warning("Не удалось создать задачу %s: %s", task_name, error_text)
+
+    def ensure_startup_entry(self):
+        """Создает пользовательский автозапуск при входе в Windows."""
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            raise OSError("Не удалось определить APPDATA для автозапуска.")
+
+        startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        os.makedirs(startup_dir, exist_ok=True)
+        startup_file = os.path.join(startup_dir, AUTO_RUN_STARTUP_FILE_NAME)
+
+        with open(startup_file, "w", encoding="utf-8") as f:
+            f.write("@echo off\n")
+            f.write(f"start \"\" {self.get_auto_run_command()}\n")
+
+    def ensure_automatic_run_tasks(self):
+        """Настраивает ежедневную проверку и автозапуск при входе в Windows."""
+        if os.name != "nt":
+            return
+
+        try:
+            self.create_or_update_scheduled_task(
+                AUTO_RUN_TASK_NAME_DAILY,
+                ["/SC", "DAILY", "/ST", AUTO_RUN_DAILY_TIME],
+            )
+            self.ensure_startup_entry()
+        except Exception as e:
+            logging.warning("Не удалось настроить автоматический запуск: %s", e)
+
+    def prepare_search_request(self, show_messages=True):
+        """Проверяет настройки и подготавливает запуск поиска."""
+        if self.is_searching:
+            return None
+        if self.is_adding_directory:
+            if show_messages:
+                messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
+            else:
+                logging.warning("Автопроверка пропущена: еще идет добавление директории.")
+            return None
+
+        self.threads_var.set(str(self.get_auto_threads_count()))
+        self.normalize_threads_value()
+        extensions = self.get_selected_extensions()
+        if not extensions:
+            if show_messages:
+                messagebox.showerror("Ошибка", "Не выбрано ни одного расширения файлов!")
+            else:
+                logging.error("Автопроверка не запущена: не выбрано ни одного расширения.")
+            return None
+
+        keywords = self.keywords_text.get("1.0", tk.END).strip()
+        if not keywords:
+            if show_messages:
+                messagebox.showerror("Ошибка", "Не введены ключевые слова для поиска!")
+            else:
+                logging.error("Автопроверка не запущена: не заданы ключевые слова.")
+            return None
+
+        try:
+            with open("keywords.txt", "w", encoding="utf-8") as f:
+                f.write(keywords)
+        except Exception as e:
+            if show_messages:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить ключевые слова: {e}")
+            else:
+                logging.error("Автопроверка не запущена: не удалось сохранить ключевые слова: %s", e)
+            return None
+
+        if not self.directories_list:
+            if show_messages:
+                messagebox.showerror("Ошибка", "Не выбрано ни одной директории для поиска!")
+            else:
+                logging.error("Автопроверка не запущена: список директорий пуст.")
+            return None
+
+        self.processed_files = 0
+        self.total_files = 0
+        for directory in self.directories_list:
+            self.total_files += self.count_files_to_process(directory, extensions)
+
+        if self.total_files == 0:
+            if show_messages:
+                messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
+            else:
+                logging.warning("Автопроверка пропущена: в выбранных директориях нет подходящих файлов.")
+            return None
+
+        try:
+            self.current_run_output_dir = self.create_dated_results_directory()
+        except Exception as e:
+            if show_messages:
+                messagebox.showerror("Ошибка", f"Не удалось создать папку результатов: {e}")
+            else:
+                logging.error("Автопроверка не запущена: не удалось создать папку результатов: %s", e)
+            return None
+
+        try:
+            load_keywords("keywords.txt")
+        except ValueError as e:
+            if show_messages:
+                messagebox.showerror("Ошибка", str(e))
+            else:
+                logging.error("Автопроверка не запущена: %s", e)
+            return None
+
+        return {
+            "extensions": extensions,
+        }
+
+    def start_search_request(self, search_request):
+        """Общая подготовка к запуску поиска."""
+        self.clear_all()
+        self.directory_report_paths = {}
+        self.completed_run_output_dir = None
+        self.search_completed_successfully = False
+
+        self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        start_message = f"Поиск начат: {self.search_start_time}"
+        logging.info(start_message)
+
+        self.update_config()
+
+        self.config['config']['has_pdf'] = HAS_PDF
+        self.config['config']['has_docx'] = HAS_DOCX
+        self.config['config']['has_excel'] = HAS_EXCEL
+        self.config['config']['has_7z'] = HAS_7Z
+        self.config['config']['has_rar'] = HAS_RAR
+        self.config['config']['has_ocr'] = HAS_OCR
+
+        try:
+            file_handler = logging.FileHandler('search_log.txt', mode='a', encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(file_handler)
+        except Exception as e:
+            logging.error(f"Не удалось настроить файловое логирование: {e}")
+
+        self.start_button.config(state=tk.DISABLED)
+        self.pause_button.config(state=tk.NORMAL, text="Пауза")
+        self.stop_button.config(state=tk.NORMAL)
+        self.is_searching = True
+        self.is_paused = False
+        self.processed_files = 0
+
+        self.search_thread = threading.Thread(
+            target=self.run_search,
+            args=(search_request["extensions"], self.update_progress_callback)
+        )
+        self.search_thread.daemon = True
+        self.search_thread.start()
+
+    def start_automatic_search(self):
+        """Запускает скрытую автоматическую проверку."""
+        search_request = self.prepare_search_request(show_messages=False)
+        if not search_request:
+            self.root.after(0, self.root.destroy)
+            return
+
+        self.start_search_request(search_request)
+
     def add_directory(self):
         """Добавление директории для поиска"""
         if self.is_adding_directory:
@@ -603,103 +888,11 @@ class SearchApp:
 
     def start_search(self):
         """Запуск поиска в отдельном потоке"""
-        if self.is_searching:
-            return
-        if self.is_adding_directory:
-            messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
+        search_request = self.prepare_search_request(show_messages=True)
+        if not search_request:
             return
 
-        # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
-        self.threads_var.set(str(self.get_auto_threads_count()))
-        self.normalize_threads_value()
-
-        extensions = self.get_selected_extensions()
-
-        if not extensions:
-            messagebox.showerror("Ошибка", "Не выбрано ни одного расширения файлов!")
-            return
-
-        # Получаем ключевые слова
-        keywords = self.keywords_text.get("1.0", tk.END).strip()
-        if not keywords:
-            messagebox.showerror("Ошибка", "Не введены ключевые слова для поиска!")
-            return
-
-        # Сохраняем ключевые слова в файл
-        try:
-            with open("keywords.txt", "w", encoding="utf-8") as f:
-                f.write(keywords)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить ключевые слова: {e}")
-            return
-
-        # Проверяем директории
-        if not self.directories_list:
-            messagebox.showerror("Ошибка", "Не выбрано ни одной директории для поиска!")
-            return
-
-        # Сбрасываем счетчики
-        self.processed_files = 0
-        self.total_files = 0
-
-        # Подсчитываем общее количество файлов для прогресса
-        for directory in self.directories_list:
-            self.total_files += self.count_files_to_process(directory, extensions)
-
-        if self.total_files == 0:
-            messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
-            return
-
-        # Очищаем результаты и лог
-        self.clear_all()
-
-        # Записываем время начала поиска
-        self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        start_message = f"Поиск начат: {self.search_start_time}"
-        logging.info(start_message)
-
-        # Обновляем конфиг
-        self.update_config()
-
-        # Добавляем информацию о доступности модулей в конфиг
-        self.config['config']['has_pdf'] = HAS_PDF
-        self.config['config']['has_docx'] = HAS_DOCX
-        self.config['config']['has_excel'] = HAS_EXCEL
-        self.config['config']['has_7z'] = HAS_7Z
-        self.config['config']['has_rar'] = HAS_RAR
-        self.config['config']['has_ocr'] = HAS_OCR
-
-        # Настраиваем логирование без удаления файла
-        try:
-            # Просто добавляем обработчик, не удаляем старый файл
-            file_handler = logging.FileHandler('search_log.txt', mode='a', encoding='utf-8')
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            logging.getLogger().addHandler(file_handler)
-        except Exception as e:
-            logging.error(f"Не удалось настроить файловое логирование: {e}")
-
-        # Загружаем ключевые слова
-        try:
-            load_keywords("keywords.txt")
-        except ValueError as e:
-            messagebox.showerror("Ошибка", str(e))
-            return
-
-        # Меняем состояние кнопок
-        self.start_button.config(state=tk.DISABLED)
-        self.pause_button.config(state=tk.NORMAL, text="Пауза")
-        self.stop_button.config(state=tk.NORMAL)
-        self.is_searching = True
-        self.is_paused = False
-        self.processed_files = 0
-
-        # Запускаем поиск в отдельном потоке
-        self.search_thread = threading.Thread(
-            target=self.run_search,
-            args=(extensions, self.update_progress_callback)  # Передаем callback
-        )
-        self.search_thread.daemon = True
-        self.search_thread.start()
+        self.start_search_request(search_request)
 
     def stop_search(self):
         """Остановка поиска"""
@@ -736,6 +929,7 @@ class SearchApp:
             self.processed_files = 0
             threads_count = self.normalize_threads_value()
             logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
+            used_report_names = set()
 
             # Выполняем поиск для каждой директории с накоплением счетчика
             for directory in self.directories_list:
@@ -744,16 +938,19 @@ class SearchApp:
                     break
 
                 logging.info(f"Начинаем поиск в директории: {directory}")
+                directory_name = os.path.basename(os.path.normpath(directory)) or os.path.normpath(directory)
+                report_path = self.get_directory_report_path(directory, used_report_names)
+                self.directory_report_paths[directory] = report_path
 
                 # Обновляем статус - начало обработки директории
-                self.root.after(0, lambda: self.update_progress(f"Начата обработка: {os.path.basename(directory)}"))
+                self.root.after(0, lambda name=directory_name: self.update_progress(f"Начата обработка: {name}"))
 
                 # Используем модифицированную функцию поиска с прогрессом
                 results = search_files(
                     directory,
                     extensions,
                     threads_count,
-                    "search_results.txt",
+                    report_path,
                     int(self.max_size_var.get()),
                     self.config['config'],
                     progress_callback,
@@ -776,11 +973,15 @@ class SearchApp:
                 # Используем другое сообщение, не "Поиск завершен"
                 if self.is_searching:
                     self.root.after(0,
-                                    lambda: self.update_progress(f"Завершена обработка: {os.path.basename(directory)}"))
+                                    lambda name=directory_name: self.update_progress(f"Завершена обработка: {name}"))
 
             # Только после ВСЕХ директорий показываем завершение поиска
             if self.is_searching:
                 logging.info("Поиск завершен!")
+                logging.info("Отчеты сохранены в папку: %s", self.current_run_output_dir)
+                self.completed_run_output_dir = self.current_run_output_dir
+                self.search_completed_successfully = True
+                self.save_last_successful_run()
                 self.root.after(0, lambda: self.update_progress("Поиск завершен"))
 
         except Exception as e:
@@ -831,9 +1032,13 @@ class SearchApp:
         self.start_button.config(state=tk.NORMAL)
         self.pause_button.config(state=tk.DISABLED, text="Пауза")
         self.stop_button.config(state=tk.DISABLED)
+        if self.search_completed_successfully and self.completed_run_output_dir:
+            self.current_file.set(f"Поиск завершен. Отчеты: {self.completed_run_output_dir}")
         # Если остановка была пользователем, финализируем человекочитаемый статус
         if self.current_file.get() == "Останавливаем поиск...":
             self.current_file.set("Поиск остановлен пользователем")
+        if self.auto_run_mode:
+            self.root.after(500, self.root.destroy)
 
     def update_config(self, reload_after_save=True):
         """Обновление конфигурации"""
@@ -852,13 +1057,17 @@ class SearchApp:
             'theme': self.theme_var.get(),
             'threads': str(threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
+            'results_folder': current_cfg.get('results_folder', DEFAULT_RESULTS_FOLDER),
+            'last_successful_run': current_cfg.get('last_successful_run', ''),
             'search_images': 'true' if self.search_images_var.get() else 'false',
             'max_file_size': self.max_size_var.get(),
             'log_file': current_cfg.get('log_file', 'search_log.txt'),
             'tesseract_languages': current_cfg.get('tesseract_languages', 'rus'),
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
             # Новые параметры для тонкой настройки поиска
+            'max_image_size_mb': str(current_cfg.get('max_image_size_mb', 10)),
             'max_pdf_pages': self.max_pdf_pages_var.get(),
+            'max_excel_rows_per_sheet': str(current_cfg.get('max_excel_rows_per_sheet', 0)),
         }
 
         # Сохраняем конфиг
@@ -952,21 +1161,36 @@ class SearchApp:
 
 def main():
     """Основная функция"""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--auto-run", action="store_true")
+    args, _unknown = parser.parse_known_args()
+
     root = tk.Tk()
     root.withdraw()
 
-    entered_password = simpledialog.askstring(
-        "Вход в приложение",
-        "Введите пароль:",
-        show="*",
-        parent=root
-    )
-    password_is_valid = entered_password == APP_PASSWORD
+    password_is_valid = True
+    if not args.auto_run:
+        entered_password = simpledialog.askstring(
+            "Вход в приложение",
+            "Введите пароль:",
+            show="*",
+            parent=root
+        )
+        password_is_valid = entered_password == APP_PASSWORD
 
-    app = SearchApp(root)
-    root.deiconify()
+    app = SearchApp(root, auto_run_mode=args.auto_run)
 
-    if not password_is_valid:
+    if args.auto_run:
+        if app.is_automatic_run_due():
+            app.start_automatic_search()
+        else:
+            logging.info("Автоматическая проверка пока не требуется: с последнего успешного запуска прошло меньше недели.")
+            root.destroy()
+            return
+    else:
+        root.deiconify()
+
+    if not args.auto_run and not password_is_valid:
         root.title("Поиск файлов по ключевым словам [Ограниченный доступ]")
         messagebox.showwarning(
             "Неверный пароль",

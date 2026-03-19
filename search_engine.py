@@ -75,14 +75,14 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
     if output_file:
         try:
             file_is_empty = (not os.path.exists(output_file)) or os.path.getsize(output_file) == 0
-            if start_count == 0 and file_is_empty:
+            if file_is_empty:
                 output_handle = open(output_file, 'w', encoding=SEARCH_RESULTS_ENCODING)
             else:
                 output_handle = open(output_file, 'a', encoding='utf-8')
 
-            # Пишем заголовок только если файл пустой и это самое начало
-            if start_count == 0 and file_is_empty:
+            if file_is_empty:
                 output_handle.write("Результаты поиска:\n\n")
+                output_handle.write(f"Директория: {root_dir}\n")
                 output_handle.write(f"Время начала: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         except OSError as e:
             logging.error(f"Не удалось проверить размер файла результатов {output_file}: {e}")
@@ -161,6 +161,9 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
             executor.shutdown(wait=True)
 
     if output_handle:
+        if not results and not stop_requested:
+            output_handle.write("Совпадения не найдены.\n")
+            output_handle.flush()
         output_handle.close()
 
     logging.info(f"Завершена обработка директории {root_dir}. Найдено совпадений: {len(results)}")

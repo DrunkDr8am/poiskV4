@@ -14,6 +14,8 @@ def load_config(config_file="config.txt"):
         'theme': 'Светлая',
         'threads': '4',
         'output_file': 'search_results.txt',
+        'results_folder': 'Результаты_проверки',
+        'last_successful_run': '',
         'search_images': 'false',
         'max_file_size': '50',
         'log_file': 'search_log.txt',
@@ -41,6 +43,8 @@ def load_config(config_file="config.txt"):
     theme = config.get('Settings', 'theme', fallback=defaults['theme'])
     threads = config.getint('Settings', 'threads', fallback=int(defaults['threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
+    results_folder = config.get('Settings', 'results_folder', fallback=defaults['results_folder'])
+    last_successful_run = config.get('Settings', 'last_successful_run', fallback=defaults['last_successful_run'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
     max_file_size = config.getint('Settings', 'max_file_size', fallback=int(defaults['max_file_size']))
     log_file = config.get('Settings', 'log_file', fallback=defaults['log_file'])
@@ -64,6 +68,8 @@ def load_config(config_file="config.txt"):
     directory = directories[0]
     theme = theme.strip() or defaults['theme']
     output_file = output_file.strip()
+    results_folder = results_folder.strip() or defaults['results_folder']
+    last_successful_run = last_successful_run.strip()
     log_file = log_file.strip()
 
     # Если поиск по изображениям отключен, убираем изображения из расширений
@@ -79,6 +85,8 @@ def load_config(config_file="config.txt"):
         'theme': theme,
         'threads': threads,
         'output_file': output_file,
+        'results_folder': results_folder,
+        'last_successful_run': last_successful_run,
         'search_images': search_images,
         'max_file_size': max_file_size,
         'log_file': log_file,
@@ -112,6 +120,12 @@ threads = 4
 
 # Файл для сохранения результатов
 output_file = search_results.txt
+
+# Папка на рабочем столе для результатов
+results_folder = Результаты_проверки
+
+# Дата и время последней успешной автоматической/ручной проверки
+last_successful_run =
 
 # Поиск по изображениям (требует установленного Tesseract OCR)
 search_images = true
