@@ -96,21 +96,6 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         logging.warning("Модули для OCR (Pillow/pytesseract) не установлены. Пропуск изображения.")
         return set()
 
-    # Лимит на размер изображения (в МБ), чтобы не перегружать OCR
-    max_image_size_mb = config.get('max_image_size_mb', 10)
-
-    # Если передан путь к файлу, проверяем его размер
-    if isinstance(image_data, str):
-        try:
-            file_size_mb = os.path.getsize(image_data) / (1024 * 1024)
-            if file_size_mb > max_image_size_mb:
-                logging.info(
-                    f"Пропуск изображения {image_data} (размер {file_size_mb:.2f} МБ превышает лимит {max_image_size_mb} МБ)"
-                )
-                return set()
-        except Exception as e:
-            logging.debug(f"Не удалось получить размер изображения {image_data}: {e}")
-
     try:
         img = Image.open(image_data) if isinstance(image_data, BytesIO) else Image.open(image_data)
 
@@ -202,10 +187,7 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
 
 
 def search_in_excel(excel_path: str, config: dict) -> Set[str]:
-    """Обработка Excel файлов с поддержкой старых форматов .xls
-
-    Использует настройку max_excel_rows_per_sheet из конфига (0 = без ограничения).
-    """
+    """Обработка Excel файлов с поддержкой старых форматов .xls."""
     found = set()
     try:
         # Пропускаем временные файлы Excel
@@ -220,16 +202,9 @@ def search_in_excel(excel_path: str, config: dict) -> Set[str]:
             try:
                 import openpyxl
                 wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
-                max_rows_per_sheet = int(config.get('max_excel_rows_per_sheet', 0) or 0)
                 for sheet in wb.sheetnames:
                     ws = wb[sheet]
                     for row_index, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                        if max_rows_per_sheet and row_index > max_rows_per_sheet:
-                            logging.info(
-                                f"Пропуск оставшихся строк в листе {sheet} файла {excel_path} "
-                                f"(достигнут лимит {max_rows_per_sheet} строк)"
-                            )
-                            break
                         for cell in row:
                             if cell and isinstance(cell, str):
                                 found.update(search_in_text(cell))

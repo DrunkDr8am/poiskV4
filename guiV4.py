@@ -39,6 +39,7 @@ class SearchApp:
         self.search_thread = None
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
+        self.theme_var = tk.StringVar(value="Светлая")
         self.total_files = 0
         self.processed_files = 0
         self.search_start_time = None  # Время начала поиска
@@ -63,6 +64,12 @@ class SearchApp:
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+    @staticmethod
+    def get_auto_threads_count():
+        """Автовыбор потоков: CPU-2, либо 1 при CPU<=2."""
+        cpu_count = os.cpu_count() or 1
+        return cpu_count - 2 if cpu_count > 2 else 1
 
     def load_configuration(self):
         """Загрузка конфигурации"""
@@ -126,177 +133,206 @@ class SearchApp:
         HAS_OCR = setup_tesseract()
 
     def create_widgets(self):
-        # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
 
-        # Configure grid weights
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(1, weight=1)
-        main_frame.rowconfigure(7, weight=1)
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Row 0: Extensions selection
-        ttk.Label(main_frame, text="Расширения файлов:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        extensions_frame = ttk.Frame(main_frame)
-        extensions_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
-        columns = 5
-        for index, ext in enumerate(self.extension_options):
-            row = index // columns
-            col = index % columns
-            ttk.Checkbutton(
-                extensions_frame,
-                text=ext,
-                variable=self.extension_vars[ext]
-            ).grid(row=row, column=col, sticky=tk.W, padx=(0, 12), pady=2)
+        search_tab = ttk.Frame(self.notebook, padding="8")
+        settings_tab = ttk.Frame(self.notebook, padding="8")
+        self.notebook.add(search_tab, text="Поиск")
+        self.notebook.add(settings_tab, text="Настройки поиска")
 
-        # Row 1: Keywords
-        ttk.Label(main_frame, text="Ключевые слова:").grid(row=1, column=0, sticky=tk.NW, pady=5)
+        # ---------------- Поиск ----------------
+        search_tab.columnconfigure(1, weight=1)
+        search_tab.rowconfigure(4, weight=1)
 
-        keywords_frame = ttk.Frame(main_frame)
-        keywords_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        ttk.Label(search_tab, text="Директории для поиска:").grid(row=0, column=0, sticky=tk.NW, pady=5)
+        dir_frame = ttk.Frame(search_tab)
+        dir_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        dir_frame.columnconfigure(0, weight=1)
 
-        self.keywords_text = scrolledtext.ScrolledText(keywords_frame, height=5)
-        self.keywords_text.pack(fill=tk.BOTH, expand=True)
-
-        # Загружаем ключевые слова из файла, если он существует
-        if os.path.exists("keywords.txt"):
-            try:
-                with open("keywords.txt", "r", encoding="utf-8") as f:
-                    keywords = f.read()
-                    self.keywords_text.insert("1.0", keywords)
-            except:
-                pass
-
-        # Row 2: Directories
-        ttk.Label(main_frame, text="Директории для поиска:").grid(row=2, column=0, sticky=tk.NW, pady=5)
-
-        dir_frame = ttk.Frame(main_frame)
-        dir_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
-
-        self.dirs_listbox = tk.Listbox(dir_frame, height=4)
-        self.dirs_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.dirs_listbox = tk.Listbox(dir_frame, height=5)
+        self.dirs_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         scrollbar = ttk.Scrollbar(dir_frame, orient=tk.VERTICAL, command=self.dirs_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.dirs_listbox.configure(yscrollcommand=scrollbar.set)
 
         dir_btn_frame = ttk.Frame(dir_frame)
-        dir_btn_frame.pack(side=tk.RIGHT, padx=(5, 0))
-
+        dir_btn_frame.grid(row=0, column=2, padx=(6, 0), sticky=tk.N)
         ttk.Button(dir_btn_frame, text="Добавить", command=self.add_directory).pack(pady=2)
         ttk.Button(dir_btn_frame, text="Удалить", command=self.remove_directory).pack(pady=2)
 
-        # Добавляем директорию по умолчанию из config.txt
         default_directory = self.config['config'].get('directory', '.')
         self.directories_list.append(default_directory)
         self.dirs_listbox.insert(tk.END, default_directory)
 
-        # Row 3: Options
-        options_frame = ttk.Frame(main_frame)
-        options_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
-
-        ttk.Label(options_frame, text="Потоки:").pack(side=tk.LEFT, padx=(0, 5))
-        self.threads_var = tk.StringVar(value=str(self.config['config'].get('threads', 4)))
-        threads_spin = ttk.Spinbox(options_frame, from_=1, to=16, textvariable=self.threads_var, width=5)
-        threads_spin.pack(side=tk.LEFT, padx=(0, 20))
-
-        ttk.Label(options_frame, text="Макс. размер файла (МБ):").pack(side=tk.LEFT, padx=(0, 5))
-        self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
-        max_size_spin = ttk.Spinbox(options_frame, from_=1, to=1000, textvariable=self.max_size_var, width=5)
-        max_size_spin.pack(side=tk.LEFT, padx=(0, 20))
-
-        self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
-        ttk.Checkbutton(options_frame, text="Поиск по изображениям (OCR)",
-                        variable=self.search_images_var).pack(side=tk.LEFT)
-
-        # Row 4: Advanced options
-        ttk.Label(main_frame, text="Доп. настройки:").grid(row=4, column=0, sticky=tk.W, pady=5)
-
-        advanced_options_frame = ttk.Frame(main_frame)
-        advanced_options_frame.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=5)
-
-        ttk.Label(advanced_options_frame, text="Макс. размер изображения (МБ):").pack(side=tk.LEFT, padx=(0, 5))
-        self.max_image_size_var = tk.StringVar(value=str(self.config['config'].get('max_image_size_mb', 10)))
-        max_image_size_spin = ttk.Spinbox(
-            advanced_options_frame, from_=1, to=500, textvariable=self.max_image_size_var, width=6
-        )
-        max_image_size_spin.pack(side=tk.LEFT, padx=(0, 20))
-
-        ttk.Label(advanced_options_frame, text="Макс. страниц PDF (0=без лимита):").pack(side=tk.LEFT, padx=(0, 5))
-        self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
-        max_pdf_pages_spin = ttk.Spinbox(
-            advanced_options_frame, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=8
-        )
-        max_pdf_pages_spin.pack(side=tk.LEFT, padx=(0, 20))
-
-        ttk.Label(advanced_options_frame, text="Макс. строк Excel (0=без лимита):").pack(side=tk.LEFT, padx=(0, 5))
-        self.max_excel_rows_var = tk.StringVar(value=str(self.config['config'].get('max_excel_rows_per_sheet', 0)))
-        max_excel_rows_spin = ttk.Spinbox(
-            advanced_options_frame, from_=0, to=1000000, textvariable=self.max_excel_rows_var, width=8
-        )
-        max_excel_rows_spin.pack(side=tk.LEFT)
-
-        # Row 5: Progress
-        ttk.Label(main_frame, text="Прогресс:").grid(row=5, column=0, sticky=tk.W, pady=5)
-
-        progress_frame = ttk.Frame(main_frame)
-        progress_frame.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=5)
-
+        ttk.Label(search_tab, text="Прогресс:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        progress_frame = ttk.Frame(search_tab)
+        progress_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        progress_frame.columnconfigure(0, weight=1)
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_value, maximum=100)
-        self.progress_bar.pack(fill=tk.X, expand=True)
+        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        ttk.Label(progress_frame, textvariable=self.current_file).grid(row=1, column=0, sticky=(tk.W, tk.E))
 
-        ttk.Label(progress_frame, textvariable=self.current_file).pack(fill=tk.X)
-
-        # Row 6: Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=6, column=0, columnspan=2, pady=10)
-
+        button_frame = ttk.Frame(search_tab)
+        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
         self.start_button = ttk.Button(button_frame, text="Начать поиск", command=self.start_search)
         self.start_button.pack(side=tk.LEFT, padx=5)
-
         self.pause_button = ttk.Button(button_frame, text="Пауза", command=self.toggle_pause, state=tk.DISABLED)
         self.pause_button.pack(side=tk.LEFT, padx=5)
-
         self.stop_button = ttk.Button(button_frame, text="Закончить поиск", command=self.stop_search, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
-
         ttk.Button(button_frame, text="Сохранить результаты", command=self.save_results).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Очистить всё", command=self.clear_all).pack(side=tk.LEFT, padx=5)
 
-        # Row 7: Results
-        ttk.Label(main_frame, text="Результаты поиска:").grid(row=7, column=0, sticky=tk.NW, pady=5)
-
-        results_frame = ttk.Frame(main_frame)
-        results_frame.grid(row=7, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        ttk.Label(search_tab, text="Результаты поиска:").grid(row=3, column=0, sticky=tk.NW, pady=5)
+        results_frame = ttk.Frame(search_tab)
+        results_frame.grid(row=3, column=1, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         results_frame.columnconfigure(0, weight=1)
         results_frame.rowconfigure(0, weight=1)
-
-        self.results_table = ttk.Treeview(
-            results_frame,
-            columns=("keywords", "file"),
-            show="headings",
-            height=10
-        )
+        self.results_table = ttk.Treeview(results_frame, columns=("keywords", "file"), show="headings", height=14)
         self.results_table.heading("keywords", text="Найденные слова")
         self.results_table.heading("file", text="Ссылка на файл")
-        # Фиксированная ширина колонок (без растягивания)
         self.results_table.column("keywords", width=320, minwidth=320, stretch=False, anchor=tk.W)
         self.results_table.column("file", width=620, minwidth=620, stretch=False, anchor=tk.W)
-
         results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_table.yview)
         self.results_table.configure(yscrollcommand=results_scrollbar.set)
-
         self.results_table.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         results_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-
-        self.results_table.tag_configure('hover', background='#eaf3ff')
         self.hovered_result_item = None
         self.results_table.bind("<Double-Button-1>", self.open_result_file)
         self.results_table.bind("<Motion>", self.on_results_hover)
         self.results_table.bind("<Leave>", self.on_results_leave)
 
-        # Настраиваем базовое логирование приложения
+        # ---------------- Настройки поиска ----------------
+        settings_tab.columnconfigure(1, weight=1)
+        settings_tab.grid_anchor("nw")
+
+        # Поля настроек идут по порядку
+        ttk.Label(settings_tab, text="Расширения файлов:").grid(row=0, column=0, sticky=tk.NW, pady=3)
+        extensions_frame = ttk.Frame(settings_tab)
+        extensions_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=3)
+        columns = 5
+        for index, ext in enumerate(self.extension_options):
+            row = index // columns
+            col = index % columns
+            ttk.Checkbutton(extensions_frame, text=ext, variable=self.extension_vars[ext]).grid(
+                row=row, column=col, sticky=tk.W, padx=(0, 12), pady=2
+            )
+
+        ttk.Label(settings_tab, text="Ключевые слова:").grid(row=1, column=0, sticky=tk.NW, pady=3)
+        keywords_frame = ttk.Frame(settings_tab)
+        keywords_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=3)
+        keywords_frame.columnconfigure(0, weight=1)
+        self.keywords_text = scrolledtext.ScrolledText(keywords_frame, height=5)
+        self.keywords_text.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        if os.path.exists("keywords.txt"):
+            try:
+                with open("keywords.txt", "r", encoding="utf-8") as f:
+                    self.keywords_text.insert("1.0", f.read())
+            except Exception:
+                pass
+
+        ttk.Label(settings_tab, text="Потоки:").grid(row=2, column=0, sticky=tk.W, pady=3)
+        auto_threads = self.get_auto_threads_count()
+        self.threads_var = tk.StringVar(value=str(auto_threads))
+        threads_spin = ttk.Spinbox(
+            settings_tab, from_=1, to=max(16, auto_threads), textvariable=self.threads_var, width=8
+        )
+        threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(settings_tab, text="Макс. размер файла (МБ):").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
+        max_size_spin = ttk.Spinbox(settings_tab, from_=1, to=1000, textvariable=self.max_size_var, width=8)
+        max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
+
+        self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
+        ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=4, column=0, sticky=tk.W, pady=3)
+        ttk.Checkbutton(settings_tab, text="Включить OCR", variable=self.search_images_var).grid(
+            row=4, column=1, sticky=tk.W, pady=3
+        )
+
+        ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=5, column=0, sticky=tk.W, pady=3)
+        self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
+        max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
+        max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=6, column=0, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
+        self.theme_toggle_button.grid(row=6, column=1, sticky=tk.W, pady=(8, 3))
+
         self.setup_logging()
+        self.apply_theme(self.theme_var.get())
+
+    def toggle_theme(self):
+        if self.theme_var.get() == "Светлая":
+            self.theme_var.set("Темная")
+        else:
+            self.theme_var.set("Светлая")
+        self.apply_theme(self.theme_var.get())
+
+    def apply_theme(self, theme_name: str):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        if theme_name == "Темная":
+            colors = {
+                "bg": "#1f1f1f",
+                "panel": "#2a2a2a",
+                "fg": "#e8e8e8",
+                "entry_bg": "#333333",
+                "accent": "#a855f7",
+                "hover": "#4a3b5c",
+            }
+        else:
+            colors = {
+                "bg": "#f2f5fa",
+                "panel": "#ffffff",
+                "fg": "#1f2937",
+                "entry_bg": "#ffffff",
+                "accent": "#8b5cf6",
+                "hover": "#efe7ff",
+            }
+
+        self.root.configure(bg=colors["bg"])
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TButton", background=colors["panel"], foreground=colors["fg"])
+        style.map("TButton", background=[("active", colors["accent"])], foreground=[("active", "#ffffff")])
+        style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TNotebook", background=colors["bg"], borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background=colors["panel"],
+            foreground=colors["fg"],
+            padding=(12, 7),
+            font=("Segoe UI", 9)
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", colors["accent"]), ("!selected", colors["panel"])],
+            foreground=[("selected", "#ffffff"), ("!selected", colors["fg"])],
+            padding=[("selected", (12, 7)), ("!selected", (12, 7))],
+            font=[("selected", ("Segoe UI", 9)), ("!selected", ("Segoe UI", 9))]
+        )
+        style.configure("Treeview", background=colors["entry_bg"], foreground=colors["fg"], fieldbackground=colors["entry_bg"])
+        style.configure("Treeview.Heading", background=colors["panel"], foreground=colors["fg"])
+        style.configure("TProgressbar", troughcolor=colors["panel"], background=colors["accent"])
+        style.configure("TCombobox", fieldbackground=colors["entry_bg"], background=colors["panel"], foreground=colors["fg"])
+
+        self.dirs_listbox.configure(bg=colors["entry_bg"], fg=colors["fg"], selectbackground=colors["accent"], selectforeground="#ffffff")
+        self.keywords_text.configure(bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
+        self.results_table.tag_configure('hover', background=colors["hover"])
+        if self.theme_var.get() == "Темная":
+            self.theme_toggle_button.config(text="🌙 Темная")
+        else:
+            self.theme_toggle_button.config(text="☀ Светлая")
 
     def setup_logging(self):
         """Настройка базового логирования приложения"""
@@ -431,6 +467,9 @@ class SearchApp:
         """Запуск поиска в отдельном потоке"""
         if self.is_searching:
             return
+
+        # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
+        self.threads_var.set(str(self.get_auto_threads_count()))
 
         extensions = self.get_selected_extensions()
 
@@ -677,9 +716,7 @@ class SearchApp:
             'tesseract_languages': current_cfg.get('tesseract_languages', 'rus'),
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
             # Новые параметры для тонкой настройки поиска
-            'max_image_size_mb': self.max_image_size_var.get(),
             'max_pdf_pages': self.max_pdf_pages_var.get(),
-            'max_excel_rows_per_sheet': self.max_excel_rows_var.get(),
         }
 
         # Сохраняем конфиг
