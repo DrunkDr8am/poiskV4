@@ -83,6 +83,33 @@ def search_in_text(text: str) -> Set[str]:
     return found
 
 
+def extract_best_effort_text(file_path: str) -> str:
+    """Пытается извлечь читаемый текст из файла даже при некорректном формате."""
+    try:
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+    except Exception:
+        return ""
+
+    candidates = []
+    for encoding in ('utf-8', 'cp1251', 'utf-16le', 'latin1'):
+        try:
+            decoded = raw.decode(encoding, errors='ignore')
+            if decoded:
+                candidates.append(decoded)
+        except Exception:
+            continue
+
+    if not candidates:
+        return ""
+
+    # Склеиваем варианты декодирования и немного очищаем шум
+    merged_text = "\n".join(candidates)
+    merged_text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]+', ' ', merged_text)
+    merged_text = re.sub(r'\s+', ' ', merged_text)
+    return merged_text
+
+
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
     """Распознавание текста с изображения"""
     # Проверяем доступность OCR через конфиг
@@ -165,10 +192,28 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
     try:
         import docx2txt
     except ImportError:
-        return set()
+        docx2txt = None
 
     found = set()
     try:
+        base_name = os.path.basename(docx_path)
+        file_ext = os.path.splitext(docx_path)[1].lower()
+
+        # Для временных файлов Office, старых .doc и "битых" .docx
+        # используем fallback-поиск по извлекаемому тексту.
+        use_fallback = (
+            base_name.startswith('~$')
+            or file_ext == '.doc'
+            or not zipfile.is_zipfile(docx_path)
+            or docx2txt is None
+        )
+
+        if use_fallback:
+            fallback_text = extract_best_effort_text(docx_path)
+            if fallback_text:
+                return search_in_text(fallback_text)
+            return set()
+
         # Текст из документа
         text = docx2txt.process(docx_path)
         found.update(search_in_text(text))
@@ -182,7 +227,11 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
                         img_path = os.path.join(temp_dir, img_file)
                         found.update(search_in_image(img_path, config))
     except Exception as e:
-        logging.error(f"Ошибка обработки DOCX {docx_path}: {e}")
+        # Если штатная обработка не удалась, пытаемся хотя бы извлечь текст напрямую.
+        logging.warning(f"Ошибка стандартной обработки DOCX {docx_path}: {e}. Переход к fallback-обработке.")
+        fallback_text = extract_best_effort_text(docx_path)
+        if fallback_text:
+            found.update(search_in_text(fallback_text))
     return found
 
 

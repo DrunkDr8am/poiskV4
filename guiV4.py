@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import threading
 import os
 import logging
@@ -21,6 +21,9 @@ HAS_EXCEL = False
 HAS_7Z = False
 HAS_RAR = False
 HAS_OCR = False
+APP_PASSWORD = "2407"
+INVALID_PASSWORD_CLOSE_MS = 300_000
+INVALID_PASSWORD_TICK_MS = 1000
 
 
 class SearchApp:
@@ -37,9 +40,13 @@ class SearchApp:
         self.is_searching = False
         self.is_paused = False
         self.search_thread = None
+        self.directory_add_thread = None
         self.is_adding_directory = False
+        self.is_closing = False
         self.config_dirty = False
         self._updating_threads_var = False
+        self.invalid_password_timer_id = None
+        self.invalid_password_deadline_ms = None
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
         self.theme_var = tk.StringVar(value="Светлая")
@@ -123,6 +130,7 @@ class SearchApp:
         config = load_config()
         selected_extensions = [ext.strip() for ext in config.get('extensions', []) if ext.strip()]
         selected_set = set(selected_extensions)
+        self.theme_var.set(config.get('theme', 'Светлая'))
 
         # Сохраняем пользовательские расширения из конфига и показываем их как отдельные чекбоксы
         for ext in selected_extensions:
@@ -335,6 +343,8 @@ class SearchApp:
         else:
             self.theme_var.set("Светлая")
         self.apply_theme(self.theme_var.get())
+        self.config_dirty = True
+        self.update_config(reload_after_save=False)
 
     def apply_theme(self, theme_name: str):
         style = ttk.Style()
@@ -435,6 +445,7 @@ class SearchApp:
         self.adding_dir_frame.grid()
         self.adding_dir_spinner.start(10)
         worker = threading.Thread(target=self._add_directory_worker, args=(directory,), daemon=True)
+        self.directory_add_thread = worker
         worker.start()
 
     def _add_directory_worker(self, directory):
@@ -461,6 +472,7 @@ class SearchApp:
             self.adding_dir_spinner.stop()
             self.adding_dir_frame.grid_remove()
             self.is_adding_directory = False
+            self.directory_add_thread = None
             if not self.is_searching:
                 self.start_button.config(state=tk.NORMAL)
 
@@ -828,6 +840,7 @@ class SearchApp:
             'keywords_file': current_cfg.get('keywords_file', 'keywords.txt'),
             'directories': '; '.join(self.directories_list) if self.directories_list else '.',
             'directory': self.directories_list[0] if self.directories_list else current_cfg.get('directory', '.'),
+            'theme': self.theme_var.get(),
             'threads': str(threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
@@ -850,12 +863,64 @@ class SearchApp:
             self.config['config'] = new_config
 
     def on_close(self):
-        """Сохранение конфига при закрытии окна."""
+        """Корректное завершение приложения с остановкой фоновых потоков."""
+        if self.is_closing:
+            return
+
+        self.is_closing = True
+        self.is_searching = False
+        self.is_paused = False
+        self.start_button.config(state=tk.DISABLED)
+        self.pause_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        self.current_file.set("Завершение приложения...")
+        self._finish_close_when_ready()
+
+    def _finish_close_when_ready(self):
+        """Дожидается завершения фоновых потоков и закрывает окно."""
+        search_alive = self.search_thread is not None and self.search_thread.is_alive()
+        add_alive = self.directory_add_thread is not None and self.directory_add_thread.is_alive()
+
+        if search_alive or add_alive:
+            self.root.after(100, self._finish_close_when_ready)
+            return
+
+        try:
+            if self.invalid_password_timer_id is not None:
+                self.root.after_cancel(self.invalid_password_timer_id)
+                self.invalid_password_timer_id = None
+        except Exception:
+            pass
+
         try:
             if self.config_dirty:
                 self.update_config(reload_after_save=False)
         finally:
             self.root.destroy()
+
+    def start_invalid_password_timer(self):
+        """Запускает обратный отсчет до автозакрытия при неверном пароле."""
+        self.invalid_password_deadline_ms = int(time.time() * 1000) + INVALID_PASSWORD_CLOSE_MS
+        self._update_invalid_password_timer()
+
+    def _update_invalid_password_timer(self):
+        """Обновляет таймер обратного отсчета при неверном пароле."""
+        if self.invalid_password_deadline_ms is None:
+            return
+
+        remaining_ms = self.invalid_password_deadline_ms - int(time.time() * 1000)
+        if remaining_ms <= 0:
+            self.invalid_password_timer_id = None
+            self.on_close()
+            return
+
+        total_seconds = max(0, remaining_ms // 1000)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        timer_text = f"Ограниченный доступ. До закрытия: {minutes:02d}:{seconds:02d}"
+        self.current_file.set(timer_text)
+        self.root.title(f"Поиск файлов по ключевым словам [Ограниченный доступ {minutes:02d}:{seconds:02d}]")
+        self.invalid_password_timer_id = self.root.after(INVALID_PASSWORD_TICK_MS, self._update_invalid_password_timer)
 
     def save_results(self):
         """Сохранение результатов в файл"""
@@ -865,7 +930,7 @@ class SearchApp:
         )
         if filename:
             try:
-                with open(filename, 'w', encoding='utf-8') as f:
+                with open(filename, 'w', encoding='utf-8-sig') as f:
                     f.write("Результаты поиска:\n\n")
                     for item_id in self.results_table.get_children():
                         keywords, file_path = self.results_table.item(item_id, "values")
@@ -879,7 +944,28 @@ class SearchApp:
 def main():
     """Основная функция"""
     root = tk.Tk()
+    root.withdraw()
+
+    entered_password = simpledialog.askstring(
+        "Вход в приложение",
+        "Введите пароль:",
+        show="*",
+        parent=root
+    )
+    password_is_valid = entered_password == APP_PASSWORD
+
     app = SearchApp(root)
+    root.deiconify()
+
+    if not password_is_valid:
+        root.title("Поиск файлов по ключевым словам [Ограниченный доступ]")
+        messagebox.showwarning(
+            "Неверный пароль",
+            "Пароль неверный. Приложение будет закрыто через 5 минут.",
+            parent=root
+        )
+        app.start_invalid_password_timer()
+
     root.mainloop()
 
 

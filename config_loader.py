@@ -11,6 +11,7 @@ def load_config(config_file="config.txt"):
         'keywords_file': 'keywords.txt',
         'directories': '.',
         'directory': '.',
+        'theme': 'Светлая',
         'threads': '4',
         'output_file': 'search_results.txt',
         'search_images': 'false',
@@ -37,6 +38,7 @@ def load_config(config_file="config.txt"):
     keywords_file = config.get('Settings', 'keywords_file', fallback=defaults['keywords_file'])
     directory = config.get('Settings', 'directory', fallback=defaults['directory'])
     directories_raw = config.get('Settings', 'directories', fallback=defaults['directories'])
+    theme = config.get('Settings', 'theme', fallback=defaults['theme'])
     threads = config.getint('Settings', 'threads', fallback=int(defaults['threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
@@ -60,6 +62,7 @@ def load_config(config_file="config.txt"):
     if not directories:
         directories = [directory] if directory else ['.']
     directory = directories[0]
+    theme = theme.strip() or defaults['theme']
     output_file = output_file.strip()
     log_file = log_file.strip()
 
@@ -73,6 +76,7 @@ def load_config(config_file="config.txt"):
         'keywords_file': keywords_file,
         'directories': directories,
         'directory': directory,
+        'theme': theme,
         'threads': threads,
         'output_file': output_file,
         'search_images': search_images,
@@ -99,6 +103,9 @@ directories = .
 
 # Директория для поиска
 directory = .
+
+# Тема интерфейса
+theme = Светлая
 
 # Количество потоков для обработки
 threads = 4
