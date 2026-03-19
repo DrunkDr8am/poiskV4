@@ -264,13 +264,14 @@ class SearchApp:
         self.results_table = ttk.Treeview(results_frame, columns=("keywords", "file"), show="headings", height=14)
         self.results_table.heading("keywords", text="Найденные слова")
         self.results_table.heading("file", text="Ссылка на файл")
-        self.results_table.column("keywords", width=320, minwidth=320, stretch=False, anchor=tk.W)
-        self.results_table.column("file", width=620, minwidth=620, stretch=False, anchor=tk.W)
+        self.results_table.column("keywords", width=150, minwidth=100, stretch=True, anchor=tk.W)
+        self.results_table.column("file", width=850, minwidth=300, stretch=True, anchor=tk.W)
         results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_table.yview)
         self.results_table.configure(yscrollcommand=results_scrollbar.set)
         self.results_table.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         results_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.hovered_result_item = None
+        self.results_table.bind("<Configure>", self.on_results_table_resize)
         self.results_table.bind("<Double-Button-1>", self.open_result_file)
         self.results_table.bind("<Motion>", self.on_results_hover)
         self.results_table.bind("<Leave>", self.on_results_leave)
@@ -532,6 +533,14 @@ class SearchApp:
         """Добавление найденного результата в таблицу в реальном времени."""
         keywords_str = ', '.join(sorted(keywords)) if keywords else ''
         self.root.after(0, lambda: self.results_table.insert('', tk.END, values=(keywords_str, file_path)))
+
+    def on_results_table_resize(self, event):
+        """Поддерживает пропорцию колонок 15% / 85%."""
+        total_width = max(1, event.width - 4)
+        keywords_width = max(100, int(total_width * 0.15))
+        file_width = max(300, total_width - keywords_width)
+        self.results_table.column("keywords", width=keywords_width)
+        self.results_table.column("file", width=file_width)
 
     def open_result_file(self, event):
         """Открытие файла из выбранной строки таблицы по двойному клику."""
