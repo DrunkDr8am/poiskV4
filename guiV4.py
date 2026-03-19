@@ -188,7 +188,6 @@ class SearchApp:
         self.stop_button = ttk.Button(button_frame, text="Закончить поиск", command=self.stop_search, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Сохранить результаты", command=self.save_results).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Очистить всё", command=self.clear_all).pack(side=tk.LEFT, padx=5)
 
         ttk.Label(search_tab, text="Результаты поиска:").grid(row=3, column=0, sticky=tk.NW, pady=5)
         results_frame = ttk.Frame(search_tab)
@@ -289,6 +288,10 @@ class SearchApp:
                 "entry_bg": "#333333",
                 "accent": "#a855f7",
                 "hover": "#4a3b5c",
+                "btn_enabled_bg": "#3a3a3a",
+                "btn_enabled_fg": "#f3f3f3",
+                "btn_disabled_bg": "#262626",
+                "btn_disabled_fg": "#7a7a7a",
             }
         else:
             colors = {
@@ -298,13 +301,29 @@ class SearchApp:
                 "entry_bg": "#ffffff",
                 "accent": "#8b5cf6",
                 "hover": "#efe7ff",
+                "btn_enabled_bg": "#ffffff",
+                "btn_enabled_fg": "#1f2937",
+                "btn_disabled_bg": "#e5e7eb",
+                "btn_disabled_fg": "#9ca3af",
             }
 
         self.root.configure(bg=colors["bg"])
         style.configure("TFrame", background=colors["bg"])
         style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
-        style.configure("TButton", background=colors["panel"], foreground=colors["fg"])
-        style.map("TButton", background=[("active", colors["accent"])], foreground=[("active", "#ffffff")])
+        style.configure("TButton", background=colors["btn_enabled_bg"], foreground=colors["btn_enabled_fg"])
+        style.map(
+            "TButton",
+            background=[
+                ("disabled", colors["btn_disabled_bg"]),
+                ("active", colors["accent"]),
+                ("!disabled", colors["btn_enabled_bg"]),
+            ],
+            foreground=[
+                ("disabled", colors["btn_disabled_fg"]),
+                ("active", "#ffffff"),
+                ("!disabled", colors["btn_enabled_fg"]),
+            ]
+        )
         style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"])
         style.configure("TNotebook", background=colors["bg"], borderwidth=0)
         style.configure(
