@@ -1177,6 +1177,14 @@ def main():
             parent=root
         )
         password_is_valid = entered_password == APP_PASSWORD
+        if not password_is_valid:
+            messagebox.showerror(
+                "Доступ запрещен",
+                "Неверный пароль. Приложение не будет запущено.",
+                parent=root
+            )
+            root.destroy()
+            return
 
     app = SearchApp(root, auto_run_mode=args.auto_run)
 
@@ -1189,15 +1197,6 @@ def main():
             return
     else:
         root.deiconify()
-
-    if not args.auto_run and not password_is_valid:
-        root.title("Поиск файлов по ключевым словам [Ограниченный доступ]")
-        messagebox.showwarning(
-            "Неверный пароль",
-            "Пароль неверный. Приложение будет закрыто через 5 минут.",
-            parent=root
-        )
-        app.start_invalid_password_timer()
 
     root.mainloop()
 
