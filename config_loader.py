@@ -9,6 +9,7 @@ def load_config(config_file="config.txt"):
     defaults = {
         'extensions': ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z'],
         'keywords_file': 'keywords.txt',
+        'directories': '.',
         'directory': '.',
         'threads': '4',
         'output_file': 'search_results.txt',
@@ -35,6 +36,7 @@ def load_config(config_file="config.txt"):
     extensions = config.get('Settings', 'extensions', fallback=','.join(defaults['extensions'])).split(',')
     keywords_file = config.get('Settings', 'keywords_file', fallback=defaults['keywords_file'])
     directory = config.get('Settings', 'directory', fallback=defaults['directory'])
+    directories_raw = config.get('Settings', 'directories', fallback=defaults['directories'])
     threads = config.getint('Settings', 'threads', fallback=int(defaults['threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
@@ -54,6 +56,10 @@ def load_config(config_file="config.txt"):
     extensions = [ext.strip() for ext in extensions]
     keywords_file = keywords_file.strip()
     directory = directory.strip()
+    directories = [d.strip() for d in directories_raw.split(';') if d.strip()]
+    if not directories:
+        directories = [directory] if directory else ['.']
+    directory = directories[0]
     output_file = output_file.strip()
     log_file = log_file.strip()
 
@@ -65,6 +71,7 @@ def load_config(config_file="config.txt"):
     return {
         'extensions': extensions,
         'keywords_file': keywords_file,
+        'directories': directories,
         'directory': directory,
         'threads': threads,
         'output_file': output_file,
@@ -86,6 +93,9 @@ extensions = *.txt, *.pdf, *.docx, *.xlsx, *.jpg, *.png, *.zip, *.rar, *.7z
 
 # Файл с ключевыми словами (каждое слово с новой строки)
 keywords_file = keywords.txt
+
+# Директории для поиска (через ; )
+directories = .
 
 # Директория для поиска
 directory = .

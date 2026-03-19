@@ -37,6 +37,8 @@ class SearchApp:
         self.is_searching = False
         self.is_paused = False
         self.search_thread = None
+        self.is_adding_directory = False
+        self.config_dirty = False
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
         self.theme_var = tk.StringVar(value="Светлая")
@@ -53,6 +55,7 @@ class SearchApp:
 
         # Создаем интерфейс
         self.create_widgets()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Центрируем окно
         self.center_window()
@@ -154,6 +157,7 @@ class SearchApp:
         dir_frame = ttk.Frame(search_tab)
         dir_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
         dir_frame.columnconfigure(0, weight=1)
+        dir_frame.rowconfigure(1, weight=0)
 
         self.dirs_listbox = tk.Listbox(dir_frame, height=5)
         self.dirs_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -167,9 +171,23 @@ class SearchApp:
         ttk.Button(dir_btn_frame, text="Добавить", command=self.add_directory).pack(pady=2)
         ttk.Button(dir_btn_frame, text="Удалить", command=self.remove_directory).pack(pady=2)
 
-        default_directory = self.config['config'].get('directory', '.')
-        self.directories_list.append(default_directory)
-        self.dirs_listbox.insert(tk.END, default_directory)
+        self.adding_dir_frame = ttk.Frame(dir_frame)
+        self.adding_dir_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+        self.adding_dir_label = ttk.Label(self.adding_dir_frame, text="Добавление директории...")
+        self.adding_dir_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.adding_dir_spinner = ttk.Progressbar(self.adding_dir_frame, mode="indeterminate", length=150)
+        self.adding_dir_spinner.pack(side=tk.LEFT)
+        self.adding_dir_frame.grid_remove()
+
+        initial_directories = self.config['config'].get('directories', [])
+        if not initial_directories:
+            fallback_directory = self.config['config'].get('directory', '.')
+            initial_directories = [fallback_directory]
+
+        for directory in initial_directories:
+            if directory not in self.directories_list:
+                self.directories_list.append(directory)
+                self.dirs_listbox.insert(tk.END, directory)
 
         ttk.Label(search_tab, text="Прогресс:").grid(row=1, column=0, sticky=tk.W, pady=5)
         progress_frame = ttk.Frame(search_tab)
@@ -363,10 +381,46 @@ class SearchApp:
 
     def add_directory(self):
         """Добавление директории для поиска"""
+        if self.is_adding_directory:
+            return
+
         directory = filedialog.askdirectory(title="Выберите директорию для поиска")
-        if directory:
-            self.directories_list.append(directory)
-            self.dirs_listbox.insert(tk.END, directory)
+        if not directory or directory in self.directories_list:
+            return
+
+        self.is_adding_directory = True
+        self.start_button.config(state=tk.DISABLED)
+        self.adding_dir_frame.grid()
+        self.adding_dir_spinner.start(10)
+        worker = threading.Thread(target=self._add_directory_worker, args=(directory,), daemon=True)
+        worker.start()
+
+    def _add_directory_worker(self, directory):
+        """Фоновая подготовка директории перед добавлением в UI."""
+        try:
+            normalized_directory = os.path.normpath(directory)
+            self.root.after(0, lambda: self._finish_add_directory(normalized_directory))
+        except Exception as e:
+            self.root.after(0, lambda: self._finish_add_directory(None, error=e))
+
+    def _finish_add_directory(self, directory, error=None):
+        """Завершение добавления директории в основном потоке."""
+        try:
+            if error:
+                messagebox.showerror("Ошибка", f"Не удалось добавить директорию:\n{error}")
+                return
+
+            if directory and directory not in self.directories_list:
+                self.directories_list.append(directory)
+                self.dirs_listbox.insert(tk.END, directory)
+                # Помечаем конфиг измененным; сохраним позже, чтобы не тормозить UI
+                self.config_dirty = True
+        finally:
+            self.adding_dir_spinner.stop()
+            self.adding_dir_frame.grid_remove()
+            self.is_adding_directory = False
+            if not self.is_searching:
+                self.start_button.config(state=tk.NORMAL)
 
     def remove_directory(self):
         """Удаление выбранной директории"""
@@ -375,6 +429,8 @@ class SearchApp:
             index = selection[0]
             self.dirs_listbox.delete(index)
             del self.directories_list[index]
+            # Помечаем конфиг измененным; сохраним позже, чтобы не тормозить UI
+            self.config_dirty = True
 
     def clear_all(self):
         """Очистка всех полей"""
@@ -485,6 +541,9 @@ class SearchApp:
     def start_search(self):
         """Запуск поиска в отдельном потоке"""
         if self.is_searching:
+            return
+        if self.is_adding_directory:
+            messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
             return
 
         # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
@@ -648,10 +707,6 @@ class SearchApp:
                 else:
                     logging.info(f"В директории {directory} ничего не найдено.")
 
-                # Обновляем счетчик обработанных файлов для этой директории
-                files_in_dir = self.count_files_to_process(directory, extensions)
-                logging.info(f"Обработано файлов в директории {directory}: {files_in_dir}")
-
                 # Обновляем прогресс после обработки каждой директории
                 # Используем другое сообщение, не "Поиск завершен"
                 if self.is_searching:
@@ -715,7 +770,7 @@ class SearchApp:
         if self.current_file.get() == "Останавливаем поиск...":
             self.current_file.set("Поиск остановлен пользователем")
 
-    def update_config(self):
+    def update_config(self, reload_after_save=True):
         """Обновление конфигурации"""
         config = ConfigParser()
         extensions = self.get_selected_extensions()
@@ -726,6 +781,7 @@ class SearchApp:
         config['Settings'] = {
             'extensions': ', '.join(extensions),
             'keywords_file': current_cfg.get('keywords_file', 'keywords.txt'),
+            'directories': '; '.join(self.directories_list) if self.directories_list else '.',
             'directory': self.directories_list[0] if self.directories_list else current_cfg.get('directory', '.'),
             'threads': self.threads_var.get(),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
@@ -741,10 +797,20 @@ class SearchApp:
         # Сохраняем конфиг
         with open('config.txt', 'w', encoding='utf-8') as configfile:
             config.write(configfile)
+        self.config_dirty = False
 
         # Обновляем self.config без сброса значений в интерфейсе
-        new_config = load_config()
-        self.config['config'] = new_config
+        if reload_after_save:
+            new_config = load_config()
+            self.config['config'] = new_config
+
+    def on_close(self):
+        """Сохранение конфига при закрытии окна."""
+        try:
+            if self.config_dirty:
+                self.update_config(reload_after_save=False)
+        finally:
+            self.root.destroy()
 
     def save_results(self):
         """Сохранение результатов в файл"""
