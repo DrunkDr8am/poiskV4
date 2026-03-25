@@ -28,8 +28,10 @@ INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
 AUTO_RUN_INTERVAL_DAYS = 7
 AUTO_RUN_DAILY_TIME = "09:00"
-AUTO_RUN_TASK_NAME_DAILY = "PoiskV4WeeklyCheckDaily"
-AUTO_RUN_STARTUP_FILE_NAME = "PoiskV4WeeklyCheckAutoRun.cmd"
+AUTO_RUN_TASK_NAME_DAILY = "ZSearchWeeklyDaily"
+AUTO_RUN_TASK_NAME_LOGON = "ZSearchWeeklyLogon"
+LEGACY_AUTO_RUN_TASK_NAMES = ("PoiskV4WeeklyCheckDaily", "ZSearchWeeklyDaily", "ZSearchWeeklyLogon")
+LEGACY_AUTO_RUN_STARTUP_FILE_NAMES = ("PoiskV4WeeklyCheckAutoRun.cmd", "ZSearchWeeklyAutoRun.cmd")
 DEFAULT_RESULTS_FOLDER = "Результаты_проверки"
 
 
@@ -532,19 +534,35 @@ class SearchApp:
 
         return subprocess.list2cmdline(command_parts)
 
-    def create_or_update_scheduled_task(self, task_name, schedule_args):
-        """Создает или обновляет задачу планировщика Windows."""
+    @staticmethod
+    def _escape_powershell_string(value: str) -> str:
+        """Экранирует строку для одинарных кавычек PowerShell."""
+        return value.replace("'", "''")
+
+    def get_auto_run_action_parts(self):
+        """Возвращает executable и argument для планировщика задач."""
+        if getattr(sys, "frozen", False):
+            executable = os.path.abspath(sys.executable)
+            arguments = "--auto-run"
+        else:
+            python_executable = os.path.abspath(sys.executable)
+            if python_executable.lower().endswith("python.exe"):
+                pythonw_executable = python_executable[:-10] + "pythonw.exe"
+                if os.path.exists(pythonw_executable):
+                    python_executable = pythonw_executable
+            executable = python_executable
+            arguments = subprocess.list2cmdline([os.path.abspath(__file__), "--auto-run"])
+        return executable, arguments
+
+    def run_powershell_command(self, script: str):
+        """Выполняет PowerShell-скрипт без показа окна."""
         command = [
-            "schtasks",
-            "/Create",
-            "/F",
-            "/TN",
-            task_name,
-            "/TR",
-            self.get_auto_run_command(),
-            "/RL",
-            "LIMITED",
-            *schedule_args,
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
@@ -555,35 +573,90 @@ class SearchApp:
             errors='ignore',
             creationflags=creationflags
         )
+        return result
+
+    def create_or_update_daily_task(self, task_name):
+        """Создает или обновляет ежедневную задачу планировщика."""
+        executable, arguments = self.get_auto_run_action_parts()
+        task_name_ps = self._escape_powershell_string(task_name)
+        executable_ps = self._escape_powershell_string(executable)
+        arguments_ps = self._escape_powershell_string(arguments)
+        daily_time_ps = self._escape_powershell_string(AUTO_RUN_DAILY_TIME)
+        script = (
+            f"$action = New-ScheduledTaskAction -Execute '{executable_ps}' -Argument '{arguments_ps}'; "
+            f"$trigger = New-ScheduledTaskTrigger -Daily -At '{daily_time_ps}'; "
+            "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable; "
+            f"Register-ScheduledTask -TaskName '{task_name_ps}' -Action $action -Trigger $trigger "
+            "-Settings $settings -RunLevel Limited -Force"
+        )
+        result = self.run_powershell_command(script)
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
-            logging.warning("Не удалось создать задачу %s: %s", task_name, error_text)
+            logging.warning("Не удалось создать ежедневную задачу %s: %s", task_name, error_text)
 
-    def ensure_startup_entry(self):
-        """Создает пользовательский автозапуск при входе в Windows."""
+    def create_or_update_logon_task(self, task_name):
+        """Создает или обновляет задачу планировщика при входе в систему."""
+        executable, arguments = self.get_auto_run_action_parts()
+        task_name_ps = self._escape_powershell_string(task_name)
+        executable_ps = self._escape_powershell_string(executable)
+        arguments_ps = self._escape_powershell_string(arguments)
+        user_id_ps = self._escape_powershell_string(f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\"))
+        script = (
+            f"$action = New-ScheduledTaskAction -Execute '{executable_ps}' -Argument '{arguments_ps}'; "
+            "$trigger = New-ScheduledTaskTrigger -AtLogOn; "
+            "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable; "
+            f"$principal = New-ScheduledTaskPrincipal -UserId '{user_id_ps}' -LogonType Interactive -RunLevel Limited; "
+            f"Register-ScheduledTask -TaskName '{task_name_ps}' -Action $action -Trigger $trigger "
+            "-Principal $principal -Settings $settings -Force"
+        )
+        result = self.run_powershell_command(script)
+        if result.returncode != 0:
+            error_text = (result.stderr or result.stdout or "").strip()
+            logging.warning("Не удалось создать задачу при входе %s: %s", task_name, error_text)
+
+    def delete_scheduled_task_if_exists(self, task_name):
+        """Удаляет устаревшую задачу планировщика, если она существует."""
+        command = ["schtasks", "/Delete", "/F", "/TN", task_name]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            creationflags=creationflags
+        )
+        if result.returncode not in (0, 1):
+            error_text = (result.stderr or result.stdout or "").strip()
+            logging.warning("Не удалось удалить задачу %s: %s", task_name, error_text)
+
+    def delete_legacy_startup_entries(self):
+        """Удаляет старые файлы автозагрузки, если они существуют."""
         appdata = os.environ.get("APPDATA")
         if not appdata:
-            raise OSError("Не удалось определить APPDATA для автозапуска.")
+            return
 
         startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-        os.makedirs(startup_dir, exist_ok=True)
-        startup_file = os.path.join(startup_dir, AUTO_RUN_STARTUP_FILE_NAME)
-
-        with open(startup_file, "w", encoding="utf-8") as f:
-            f.write("@echo off\n")
-            f.write(f"start \"\" {self.get_auto_run_command()}\n")
+        for legacy_name in LEGACY_AUTO_RUN_STARTUP_FILE_NAMES:
+            legacy_path = os.path.join(startup_dir, legacy_name)
+            if os.path.exists(legacy_path):
+                try:
+                    os.remove(legacy_path)
+                except OSError as e:
+                    logging.warning("Не удалось удалить старый файл автозапуска %s: %s", legacy_name, e)
 
     def ensure_automatic_run_tasks(self):
-        """Настраивает ежедневную проверку и автозапуск при входе в Windows."""
+        """Настраивает ежедневную проверку и запуск при входе через планировщик Windows."""
         if os.name != "nt":
             return
 
         try:
-            self.create_or_update_scheduled_task(
-                AUTO_RUN_TASK_NAME_DAILY,
-                ["/SC", "DAILY", "/ST", AUTO_RUN_DAILY_TIME],
-            )
-            self.ensure_startup_entry()
+            for legacy_task_name in LEGACY_AUTO_RUN_TASK_NAMES:
+                if legacy_task_name not in (AUTO_RUN_TASK_NAME_DAILY, AUTO_RUN_TASK_NAME_LOGON):
+                    self.delete_scheduled_task_if_exists(legacy_task_name)
+            self.create_or_update_daily_task(AUTO_RUN_TASK_NAME_DAILY)
+            self.create_or_update_logon_task(AUTO_RUN_TASK_NAME_LOGON)
+            self.delete_legacy_startup_entries()
         except Exception as e:
             logging.warning("Не удалось настроить автоматический запуск: %s", e)
 
