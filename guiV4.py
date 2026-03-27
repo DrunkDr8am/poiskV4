@@ -484,6 +484,12 @@ class SearchApp:
                 text="Смена пароля для пользователя",
                 command=self.change_user_password
             ).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(3, 3))
+        else:
+            ttk.Label(
+                settings_tab,
+                text="Сделано Андреем ОБИС 2026",
+                font=("Segoe UI", 8)
+            ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(16, 3))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
