@@ -6,7 +6,7 @@ from typing import List, Dict, Set
 
 import logging
 
-from file_processing import process_file  # Импортируем функцию обработки файла
+from file_processing import process_file, get_long_path_reason, log_long_path_skip  # Импортируем функцию обработки файла
 
 SEARCH_RESULTS_ENCODING = 'utf-8-sig'
 
@@ -66,6 +66,10 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
         for file in files:
             file_path = os.path.join(root, file)
             if any(fnmatch.fnmatch(file, ext_pattern) for ext_pattern in extensions):
+                long_path_reason = get_long_path_reason(file_path)
+                if long_path_reason:
+                    log_long_path_skip(file_path, long_path_reason)
+                    continue
                 files_to_process.append(file_path)
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")

@@ -15,6 +15,7 @@ KEYWORDS_WORDS: Set[str] = set()
 # Ключевые слова, которые ищем как подстроки (короткие/со спецсимволами)
 KEYWORDS_SUBSTR: Set[str] = set()
 MAX_SAFE_WINDOWS_PATH_LENGTH = 240
+MAX_SAFE_WINDOWS_NAME_LENGTH = 180
 
 
 def load_keywords(keywords_file: str) -> List[str]:
@@ -111,12 +112,45 @@ def extract_best_effort_text(file_path: str) -> str:
     return merged_text
 
 
-def is_path_too_long(file_path: str) -> bool:
-    """Проверяет, что путь превышает безопасную длину для Windows-библиотек."""
-    normalized_path = os.path.abspath(file_path)
+def normalize_search_path(file_path: str) -> str:
+    """Нормализует путь без потери UNC-формата."""
+    normalized_path = os.path.normpath(file_path)
+    if os.name == 'nt' and normalized_path.startswith("\\\\"):
+        return normalized_path
+    return os.path.abspath(normalized_path)
+
+
+def get_long_path_reason(file_path: str) -> str | None:
+    """Возвращает причину пропуска файла, если путь или имя слишком длинные."""
     if os.name != 'nt':
-        return False
-    return len(normalized_path) > MAX_SAFE_WINDOWS_PATH_LENGTH
+        return None
+
+    normalized_path = normalize_search_path(file_path)
+    file_name = os.path.basename(normalized_path)
+
+    if len(normalized_path) > MAX_SAFE_WINDOWS_PATH_LENGTH:
+        return (
+            f"длина пути {len(normalized_path)} символов превышает безопасный лимит "
+            f"{MAX_SAFE_WINDOWS_PATH_LENGTH}"
+        )
+
+    if len(file_name) > MAX_SAFE_WINDOWS_NAME_LENGTH:
+        return (
+            f"длина имени файла {len(file_name)} символов превышает безопасный лимит "
+            f"{MAX_SAFE_WINDOWS_NAME_LENGTH}"
+        )
+
+    return None
+
+
+def log_long_path_skip(file_path: str, reason: str | None = None):
+    """Логирует пропуск файла из-за слишком длинного пути или имени."""
+    normalized_path = normalize_search_path(file_path)
+    skip_reason = reason or get_long_path_reason(normalized_path)
+    if not skip_reason:
+        return
+
+    logging.warning("Пропуск файла %s (%s)", normalized_path, skip_reason)
 
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
@@ -312,6 +346,10 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                 # Извлекаем файл во временную директорию один раз
                                 z.extract(file, temp_dir)
                                 extracted_file = os.path.join(temp_dir, file)
+                                long_path_reason = get_long_path_reason(extracted_file)
+                                if long_path_reason:
+                                    log_long_path_skip(extracted_file, long_path_reason)
+                                    continue
                                 if os.path.isfile(extracted_file):
                                     # Обрабатываем изображения (только если OCR доступен)
                                     if file.lower().endswith(
@@ -343,6 +381,10 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                     for root, dirs, files in os.walk(temp_dir):
                         for file in files:
                             file_path = os.path.join(root, file)
+                            long_path_reason = get_long_path_reason(file_path)
+                            if long_path_reason:
+                                log_long_path_skip(file_path, long_path_reason)
+                                continue
                             relative_path = os.path.relpath(file_path, temp_dir)
                             if any(fnmatch.fnmatch(relative_path, ext) for ext in extensions):
                                 # Обрабатываем файлы в зависимости от типа
@@ -390,6 +432,10 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                 # Извлекаем файл во временную директорию один раз
                                 z.extract(file, temp_dir)
                                 extracted_file = os.path.join(temp_dir, file)
+                                long_path_reason = get_long_path_reason(extracted_file)
+                                if long_path_reason:
+                                    log_long_path_skip(extracted_file, long_path_reason)
+                                    continue
                                 if os.path.isfile(extracted_file):
                                     # Обрабатываем изображения (только если OCR доступен)
                                     if file.lower().endswith(
@@ -415,14 +461,10 @@ def process_file(file_path: str, extensions: List[str], max_file_size: int, conf
     """Обработка отдельного файла"""
     found = set()
     try:
-        normalized_path = os.path.abspath(file_path)
-        if is_path_too_long(normalized_path):
-            logging.warning(
-                "Пропуск файла %s (длина пути %d символов превышает безопасный лимит %d)",
-                normalized_path,
-                len(normalized_path),
-                MAX_SAFE_WINDOWS_PATH_LENGTH
-            )
+        normalized_path = normalize_search_path(file_path)
+        long_path_reason = get_long_path_reason(normalized_path)
+        if long_path_reason:
+            log_long_path_skip(normalized_path, long_path_reason)
             return {}
 
         # Проверяем размер файла
