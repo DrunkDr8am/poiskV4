@@ -6,6 +6,7 @@ import logging
 import time  # Добавляем импорт модуля time
 import subprocess
 import sys
+import traceback
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -24,6 +25,22 @@ HAS_OCR = False
 APP_PASSWORD = "2407"
 INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
+CRASH_LOG_FILE = "crash_log.txt"
+
+
+def write_crash_report(error_title, exc_value, exc_traceback):
+    """Сохраняет подробности необработанной ошибки в отдельный лог-файл."""
+    report_time = time.strftime('%Y-%m-%d %H:%M:%S')
+    traceback_text = "".join(traceback.format_exception(type(exc_value), exc_value, exc_traceback))
+    report = (
+        f"[{report_time}] {error_title}\n"
+        f"{traceback_text}\n"
+        f"{'-' * 80}\n"
+    )
+    log_path = os.path.abspath(CRASH_LOG_FILE)
+    with open(log_path, "a", encoding="utf-8") as crash_file:
+        crash_file.write(report)
+    return log_path
 
 
 class SearchApp:
@@ -271,8 +288,12 @@ class SearchApp:
         self.results_table.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         results_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.hovered_result_item = None
+        self.results_context_menu = tk.Menu(self.root, tearoff=0)
+        self.results_context_menu.add_command(label="Перейти к расположению файла", command=self.open_result_location)
+        self.results_context_menu.add_command(label="Открыть файл", command=self.open_selected_result_file)
         self.results_table.bind("<Configure>", self.on_results_table_resize)
         self.results_table.bind("<Double-Button-1>", self.open_result_file)
+        self.results_table.bind("<Button-3>", self.show_results_context_menu)
         self.results_table.bind("<Motion>", self.on_results_hover)
         self.results_table.bind("<Leave>", self.on_results_leave)
 
@@ -432,6 +453,61 @@ class SearchApp:
             logger.removeHandler(handler)
         logger.setLevel(logging.INFO)
 
+    def safe_after(self, delay_ms, callback, *args, allow_when_closing=False, **kwargs):
+        """Безопасно планирует вызов в UI-потоке и не дает падать из-за after/callback."""
+        if self.is_closing and not allow_when_closing:
+            return False
+
+        def wrapped():
+            try:
+                callback(*args, **kwargs)
+            except Exception as exc:
+                self.report_runtime_error(
+                    f"Ошибка интерфейса в {getattr(callback, '__name__', 'callback')}",
+                    exc,
+                    show_dialog=True
+                )
+
+        try:
+            self.root.after(delay_ms, wrapped)
+            return True
+        except (RuntimeError, tk.TclError) as exc:
+            if not self.is_closing:
+                self.report_runtime_error("Не удалось запланировать обновление интерфейса", exc, show_dialog=False)
+            return False
+
+    def _show_runtime_error_dialog(self, error_title, error_message):
+        """Показывает пользователю подробности ошибки, если окно еще активно."""
+        if self.is_closing or not self.root.winfo_exists():
+            return
+        messagebox.showerror(error_title, error_message, parent=self.root)
+
+    def report_runtime_error(self, error_title, exc, show_dialog=True):
+        """Сохраняет ошибку, пишет ее в лог и сообщает пользователю без остановки приложения."""
+        if self.is_closing and isinstance(exc, (RuntimeError, tk.TclError)):
+            return
+
+        log_path = write_crash_report(error_title, exc, exc.__traceback__)
+        logging.exception("%s: %s", error_title, exc)
+
+        short_message = f"{error_title}: {exc}"
+        try:
+            self.safe_after(0, self.current_file.set, short_message[:300])
+        except Exception:
+            pass
+
+        if show_dialog and not self.is_closing:
+            error_message = (
+                f"{error_title}\n\n"
+                f"{exc}\n\n"
+                f"Подробности сохранены в файле:\n{log_path}\n\n"
+                "Приложение продолжит работу, если это возможно."
+            )
+            try:
+                self.safe_after(0, self._show_runtime_error_dialog, "Ошибка", error_message)
+            except Exception:
+                pass
+
     def add_directory(self):
         """Добавление директории для поиска"""
         if self.is_adding_directory:
@@ -445,7 +521,12 @@ class SearchApp:
         self.start_button.config(state=tk.DISABLED)
         self.adding_dir_frame.grid()
         self.adding_dir_spinner.start(10)
-        worker = threading.Thread(target=self._add_directory_worker, args=(directory,), daemon=True)
+        worker = threading.Thread(
+            target=self._add_directory_worker,
+            args=(directory,),
+            daemon=True,
+            name="directory-add-worker"
+        )
         self.directory_add_thread = worker
         worker.start()
 
@@ -453,9 +534,9 @@ class SearchApp:
         """Фоновая подготовка директории перед добавлением в UI."""
         try:
             normalized_directory = os.path.normpath(directory)
-            self.root.after(0, lambda: self._finish_add_directory(normalized_directory))
+            self.safe_after(0, self._finish_add_directory, normalized_directory)
         except Exception as e:
-            self.root.after(0, lambda: self._finish_add_directory(None, error=e))
+            self.safe_after(0, self._finish_add_directory, None, error=e)
 
     def _finish_add_directory(self, directory, error=None):
         """Завершение добавления директории в основном потоке."""
@@ -532,7 +613,7 @@ class SearchApp:
     def add_live_result(self, file_path, keywords):
         """Добавление найденного результата в таблицу в реальном времени."""
         keywords_str = ', '.join(sorted(keywords)) if keywords else ''
-        self.root.after(0, lambda: self.results_table.insert('', tk.END, values=(keywords_str, file_path)))
+        self.safe_after(0, self.results_table.insert, '', tk.END, values=(keywords_str, file_path))
 
     def on_results_table_resize(self, event):
         """Поддерживает пропорцию колонок 15% / 85%."""
@@ -549,23 +630,75 @@ class SearchApp:
             if not item_id:
                 return
 
-            values = self.results_table.item(item_id, "values")
-            if not values or len(values) < 2:
-                return
+            self.results_table.selection_set(item_id)
+            self._open_file_by_path(self._get_result_file_path(item_id))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
 
-            file_path = str(values[1]).strip()
+    def _get_result_file_path(self, item_id=None):
+        """Возвращает путь к файлу из выбранной строки таблицы."""
+        if item_id is None:
+            selection = self.results_table.selection()
+            item_id = selection[0] if selection else ""
+
+        if not item_id:
+            return ""
+
+        values = self.results_table.item(item_id, "values")
+        if not values or len(values) < 2:
+            return ""
+
+        return str(values[1]).strip()
+
+    def _open_file_by_path(self, file_path):
+        """Открывает файл в системе."""
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning("Файл не найден", f"Файл не существует:\n{file_path}")
+            return
+
+        if hasattr(os, "startfile"):
+            os.startfile(file_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", file_path])
+        else:
+            subprocess.Popen(["xdg-open", file_path])
+
+    def open_selected_result_file(self):
+        """Открывает файл из выбранной строки таблицы."""
+        try:
+            self._open_file_by_path(self._get_result_file_path())
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+
+    def open_result_location(self):
+        """Открывает папку с файлом из выбранной строки таблицы."""
+        try:
+            file_path = self._get_result_file_path()
             if not file_path or not os.path.exists(file_path):
                 messagebox.showwarning("Файл не найден", f"Файл не существует:\n{file_path}")
                 return
 
-            if hasattr(os, "startfile"):
-                os.startfile(file_path)
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(file_path)])
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", file_path])
+                subprocess.Popen(["open", "-R", file_path])
             else:
-                subprocess.Popen(["xdg-open", file_path])
+                subprocess.Popen(["xdg-open", os.path.dirname(file_path) or "."])
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+            messagebox.showerror("Ошибка", f"Не удалось открыть расположение файла:\n{e}")
+
+    def show_results_context_menu(self, event):
+        """Показывает контекстное меню для строки таблицы результатов."""
+        item_id = self.results_table.identify_row(event.y)
+        if not item_id:
+            return
+
+        self.results_table.selection_set(item_id)
+        self.results_table.focus(item_id)
+        try:
+            self.results_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.results_context_menu.grab_release()
 
     def on_results_hover(self, event):
         """Подсветка строки таблицы при наведении."""
@@ -696,7 +829,8 @@ class SearchApp:
         # Запускаем поиск в отдельном потоке
         self.search_thread = threading.Thread(
             target=self.run_search,
-            args=(extensions, self.update_progress_callback)  # Передаем callback
+            args=(extensions, self.update_progress_callback),  # Передаем callback
+            name="search-worker"
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -743,48 +877,54 @@ class SearchApp:
                     logging.info("Поиск остановлен пользователем")
                     break
 
-                logging.info(f"Начинаем поиск в директории: {directory}")
+                try:
+                    logging.info(f"Начинаем поиск в директории: {directory}")
 
-                # Обновляем статус - начало обработки директории
-                self.root.after(0, lambda: self.update_progress(f"Начата обработка: {os.path.basename(directory)}"))
+                    # Обновляем статус - начало обработки директории
+                    self.safe_after(0, self.update_progress, f"Начата обработка: {os.path.basename(directory)}")
 
-                # Используем модифицированную функцию поиска с прогрессом
-                results = search_files(
-                    directory,
-                    extensions,
-                    threads_count,
-                    "search_results.txt",
-                    int(self.max_size_var.get()),
-                    self.config['config'],
-                    progress_callback,
-                    self.processed_files,  # Передаем текущее значение как offset
-                    lambda: self.is_searching,
-                    self.add_live_result,
-                    lambda: self.is_paused
-                )
+                    # Используем модифицированную функцию поиска с прогрессом
+                    results = search_files(
+                        directory,
+                        extensions,
+                        threads_count,
+                        "search_results.txt",
+                        int(self.max_size_var.get()),
+                        self.config['config'],
+                        progress_callback,
+                        self.processed_files,  # Передаем текущее значение как offset
+                        lambda: self.is_searching,
+                        self.add_live_result,
+                        lambda: self.is_paused
+                    )
 
-                # Показываем результаты для текущей директории
-                if results:
-                    logging.info(f"Найдено совпадений в {len(results)} файлах в директории {directory}:")
-                    for file_path, keywords in results.items():
-                        logging.info(f"Файл: {file_path}")
-                        logging.info(f"Ключевые слова: {', '.join(keywords)}")
-                else:
-                    logging.info(f"В директории {directory} ничего не найдено.")
+                    # Показываем результаты для текущей директории
+                    if results:
+                        logging.info(f"Найдено совпадений в {len(results)} файлах в директории {directory}:")
+                        for file_path, keywords in results.items():
+                            logging.info(f"Файл: {file_path}")
+                            logging.info(f"Ключевые слова: {', '.join(keywords)}")
+                    else:
+                        logging.info(f"В директории {directory} ничего не найдено.")
 
-                # Обновляем прогресс после обработки каждой директории
-                # Используем другое сообщение, не "Поиск завершен"
-                if self.is_searching:
-                    self.root.after(0,
-                                    lambda: self.update_progress(f"Завершена обработка: {os.path.basename(directory)}"))
+                    # Обновляем прогресс после обработки каждой директории
+                    if self.is_searching:
+                        self.safe_after(0, self.update_progress, f"Завершена обработка: {os.path.basename(directory)}")
+                except Exception as directory_error:
+                    self.report_runtime_error(
+                        f"Ошибка при обработке директории {directory}",
+                        directory_error,
+                        show_dialog=True
+                    )
+                    continue
 
             # Только после ВСЕХ директорий показываем завершение поиска
             if self.is_searching:
                 logging.info("Поиск завершен!")
-                self.root.after(0, lambda: self.update_progress("Поиск завершен"))
+                self.safe_after(0, self.update_progress, "Поиск завершен")
 
         except Exception as e:
-            logging.error(f"Ошибка при поиске: {e}")
+            self.report_runtime_error("Критическая ошибка во время поиска", e, show_dialog=True)
 
         finally:
             # Записываем время окончания поиска
@@ -813,12 +953,12 @@ class SearchApp:
 
             self.is_searching = False
             self.is_paused = False
-            self.root.after(0, self.on_search_finished)
+            self.safe_after(0, self.on_search_finished)
 
     def update_progress_callback(self, file_name, processed_count):
         """Callback для обновления прогресса из search_engine"""
         # Обновляем в основном потоке через after
-        self.root.after(0, lambda: self._update_progress_in_main_thread(file_name, processed_count))
+        self.safe_after(0, self._update_progress_in_main_thread, file_name, processed_count)
 
     def _update_progress_in_main_thread(self, file_name, processed_count):
         """Обновление прогресса в основном потоке"""
@@ -891,7 +1031,7 @@ class SearchApp:
         add_alive = self.directory_add_thread is not None and self.directory_add_thread.is_alive()
 
         if search_alive or add_alive:
-            self.root.after(100, self._finish_close_when_ready)
+            self.safe_after(100, self._finish_close_when_ready, allow_when_closing=True)
             return
 
         try:
@@ -964,6 +1104,57 @@ def main():
     password_is_valid = entered_password == APP_PASSWORD
 
     app = SearchApp(root)
+
+    def handle_unhandled_exception(error_title, exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+
+        log_path = write_crash_report(error_title, exc_value, exc_traceback)
+        logging.error("%s: %s", error_title, exc_value)
+        try:
+            app.safe_after(
+                0,
+                app._show_runtime_error_dialog,
+                "Критическая ошибка",
+                (
+                    f"{error_title}\n\n"
+                    f"{exc_value}\n\n"
+                    f"Подробности сохранены в файле:\n{log_path}\n\n"
+                    "Если ошибка была нефатальной, приложение продолжит работу."
+                )
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = lambda exc_type, exc_value, exc_traceback: handle_unhandled_exception(
+        "Необработанная ошибка приложения",
+        exc_type,
+        exc_value,
+        exc_traceback
+    )
+
+    if hasattr(threading, "excepthook"):
+        def thread_exception_handler(args):
+            thread_name = args.thread.name if args.thread else "unknown-thread"
+            handle_unhandled_exception(
+                f"Необработанная ошибка в потоке {thread_name}",
+                args.exc_type,
+                args.exc_value,
+                args.exc_traceback
+            )
+
+        threading.excepthook = thread_exception_handler
+
+    root.report_callback_exception = (
+        lambda exc_type, exc_value, exc_traceback: handle_unhandled_exception(
+            "Необработанная ошибка интерфейса",
+            exc_type,
+            exc_value,
+            exc_traceback
+        )
+    )
+
     root.deiconify()
 
     if not password_is_valid:
