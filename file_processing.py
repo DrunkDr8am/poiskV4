@@ -14,6 +14,7 @@ KEYWORDS_LOWER: Set[str] = set()
 KEYWORDS_WORDS: Set[str] = set()
 # Ключевые слова, которые ищем как подстроки (короткие/со спецсимволами)
 KEYWORDS_SUBSTR: Set[str] = set()
+MAX_SAFE_WINDOWS_PATH_LENGTH = 240
 
 
 def load_keywords(keywords_file: str) -> List[str]:
@@ -108,6 +109,14 @@ def extract_best_effort_text(file_path: str) -> str:
     merged_text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]+', ' ', merged_text)
     merged_text = re.sub(r'\s+', ' ', merged_text)
     return merged_text
+
+
+def is_path_too_long(file_path: str) -> bool:
+    """Проверяет, что путь превышает безопасную длину для Windows-библиотек."""
+    normalized_path = os.path.abspath(file_path)
+    if os.name != 'nt':
+        return False
+    return len(normalized_path) > MAX_SAFE_WINDOWS_PATH_LENGTH
 
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
@@ -406,66 +415,76 @@ def process_file(file_path: str, extensions: List[str], max_file_size: int, conf
     """Обработка отдельного файла"""
     found = set()
     try:
-        # Проверяем размер файла
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if file_size_mb > max_file_size:
+        normalized_path = os.path.abspath(file_path)
+        if is_path_too_long(normalized_path):
             logging.warning(
-                f"Пропуск файла {file_path} (размер {file_size_mb:.2f} МБ превышает лимит {max_file_size} МБ)")
+                "Пропуск файла %s (длина пути %d символов превышает безопасный лимит %d)",
+                normalized_path,
+                len(normalized_path),
+                MAX_SAFE_WINDOWS_PATH_LENGTH
+            )
             return {}
 
-        ext = os.path.splitext(file_path)[1].lower()
+        # Проверяем размер файла
+        file_size_mb = os.path.getsize(normalized_path) / (1024 * 1024)
+        if file_size_mb > max_file_size:
+            logging.warning(
+                f"Пропуск файла {normalized_path} (размер {file_size_mb:.2f} МБ превышает лимит {max_file_size} МБ)")
+            return {}
+
+        ext = os.path.splitext(normalized_path)[1].lower()
 
         # Обработка в зависимости от типа файла
         if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'):
             # Проверяем доступность OCR через конфиг
             if config.get('has_ocr', False):
-                found = search_in_image(file_path, config)
+                found = search_in_image(normalized_path, config)
             else:
-                logging.info(f"Пропуск изображения {file_path} (OCR недоступен)")
+                logging.info(f"Пропуск изображения {normalized_path} (OCR недоступен)")
         elif ext == '.pdf':
             # Проверяем доступность обработки PDF
             if config.get('has_pdf', False):
-                found = search_in_pdf(file_path, config)
+                found = search_in_pdf(normalized_path, config)
             else:
-                logging.info(f"Пропуск PDF {file_path} (обработка PDF недоступна)")
+                logging.info(f"Пропуск PDF {normalized_path} (обработка PDF недоступна)")
         elif ext in ('.doc', '.docx'):
             # Проверяем доступность обработки DOCX
             if config.get('has_docx', False):
-                found = search_in_docx(file_path, config)
+                found = search_in_docx(normalized_path, config)
             else:
-                logging.info(f"Пропуск DOCX {file_path} (обработка DOCX недоступна)")
+                logging.info(f"Пропуск DOCX {normalized_path} (обработка DOCX недоступна)")
         elif ext in ('.xls', '.xlsx'):
             # Проверяем доступность обработки Excel
             if config.get('has_excel', False):
-                found = search_in_excel(file_path, config)
+                found = search_in_excel(normalized_path, config)
             else:
-                logging.info(f"Пропуск Excel {file_path} (обработка Excel недоступна)")
+                logging.info(f"Пропуск Excel {normalized_path} (обработка Excel недоступна)")
         elif ext in ('.zip', '.7z', '.rar'):
             # Для архивов проверяем доступность соответствующих модулей
             if ext == '.7z' and not config.get('has_7z', False):
-                logging.info(f"Пропуск 7Z {file_path} (обработка 7Z недоступна)")
+                logging.info(f"Пропуск 7Z {normalized_path} (обработка 7Z недоступна)")
             elif ext == '.rar' and not config.get('has_rar', False):
-                logging.info(f"Пропуск RAR {file_path} (обработка RAR недоступна)")
+                logging.info(f"Пропуск RAR {normalized_path} (обработка RAR недоступна)")
             else:
-                found = search_in_archive(file_path, extensions, config)  # Передаем config
+                found = search_in_archive(normalized_path, extensions, config)  # Передаем config
         else:
             # Обработка текстовых файлов
             try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(normalized_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                     found = search_in_text(content)
             except UnicodeDecodeError:
                 encodings = ['cp1251', 'iso-8859-1', 'latin1']
                 for encoding in encodings:
                     try:
-                        with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
+                        with open(normalized_path, 'r', encoding=encoding, errors='ignore') as f:
                             content = f.read()
                             found = search_in_text(content)
                             break
                     except UnicodeDecodeError:
                         continue
 
-        return {file_path: found} if found else {}
+        return {normalized_path: found} if found else {}
     except Exception as e:
         logging.error(f"Ошибка обработки файла {file_path}: {e}")
         return {}
