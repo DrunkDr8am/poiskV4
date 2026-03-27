@@ -1,5 +1,89 @@
 import os
 import configparser
+import hashlib
+import hmac
+
+
+ADMIN_AUTH_FILE = "admin_auth.txt"
+HASH_SCHEME_VERSION = "v2"
+ADMIN_ROLE = "admin"
+USER_ROLE = "user"
+
+
+def hash_password(password):
+    """Возвращает legacy SHA-256 хэш пароля без привязки к роли."""
+    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+
+
+def make_role_password_hash(password, role):
+    """Возвращает ролевой хэш пароля, который нельзя переиспользовать для другой роли."""
+    password_bytes = f"zsearch::{role}::{password or ''}".encode("utf-8")
+    digest = hashlib.sha256(password_bytes).hexdigest()
+    return f"{HASH_SCHEME_VERSION}:{role}:{digest}"
+
+
+def verify_password_for_role(password, stored_hash, role, conflicting_hash=""):
+    """Проверяет пароль для конкретной роли, поддерживая новый и legacy форматы."""
+    stored_hash = str(stored_hash or "").strip()
+    conflicting_hash = str(conflicting_hash or "").strip()
+    if not stored_hash:
+        return False
+
+    expected_prefix = f"{HASH_SCHEME_VERSION}:{role}:"
+    if stored_hash.startswith(expected_prefix):
+        return hmac.compare_digest(make_role_password_hash(password, role), stored_hash)
+
+    if stored_hash.startswith(f"{HASH_SCHEME_VERSION}:"):
+        return False
+
+    legacy_hash = hash_password(password)
+    if not hmac.compare_digest(legacy_hash, stored_hash):
+        return False
+
+    if conflicting_hash and hmac.compare_digest(stored_hash, conflicting_hash):
+        return False
+
+    return True
+
+
+DEFAULT_ADMIN_PASSWORD_HASH = make_role_password_hash("2407", ADMIN_ROLE)
+DEFAULT_USER_PASSWORD_HASH = make_role_password_hash("1234", USER_ROLE)
+
+
+def save_admin_password_hash(password_hash, auth_file=ADMIN_AUTH_FILE):
+    """Сохраняет хэш пароля администратора в отдельный файл."""
+    auth_config = configparser.ConfigParser()
+    auth_config["AdminAuth"] = {
+        "admin_password_hash": (password_hash or DEFAULT_ADMIN_PASSWORD_HASH).strip()
+    }
+    with open(auth_file, "w", encoding="utf-8") as authfile:
+        auth_config.write(authfile)
+
+
+def load_admin_password_hash(auth_file=ADMIN_AUTH_FILE, legacy_config_file="config.txt"):
+    """Загружает хэш администратора из отдельного файла с миграцией из старого config.txt."""
+    auth_config = configparser.ConfigParser()
+    if os.path.exists(auth_file):
+        try:
+            auth_config.read(auth_file, encoding="utf-8")
+            stored_hash = auth_config.get("AdminAuth", "admin_password_hash", fallback="").strip()
+            if stored_hash:
+                return stored_hash
+        except Exception:
+            pass
+
+    legacy_hash = ""
+    if os.path.exists(legacy_config_file):
+        legacy_config = configparser.ConfigParser()
+        try:
+            legacy_config.read(legacy_config_file, encoding="utf-8")
+            legacy_hash = legacy_config.get("Settings", "admin_password_hash", fallback="").strip()
+        except Exception:
+            legacy_hash = ""
+
+    effective_hash = legacy_hash or DEFAULT_ADMIN_PASSWORD_HASH
+    save_admin_password_hash(effective_hash, auth_file)
+    return effective_hash
 
 def load_config(config_file="config.txt"):
     """Загрузка конфигурации из файла"""
@@ -23,6 +107,7 @@ def load_config(config_file="config.txt"):
         'max_image_size_mb': '10',
         'max_pdf_pages': '0',  # 0 = без ограничения
         'max_excel_rows_per_sheet': '0',  # 0 = без ограничения
+        'user_password_hash': DEFAULT_USER_PASSWORD_HASH,
     }
 
     # Если файл конфигурации существует, загружаем его
@@ -53,6 +138,7 @@ def load_config(config_file="config.txt"):
         'max_excel_rows_per_sheet',
         fallback=int(defaults['max_excel_rows_per_sheet']),
     )
+    user_password_hash = config.get('Settings', 'user_password_hash', fallback=defaults['user_password_hash']).strip()
 
     # Очищаем значения от пробелов
     extensions = [ext.strip() for ext in extensions]
@@ -87,6 +173,8 @@ def load_config(config_file="config.txt"):
         'max_image_size_mb': max_image_size_mb,
         'max_pdf_pages': max_pdf_pages,
         'max_excel_rows_per_sheet': max_excel_rows_per_sheet,
+        'admin_password_hash': load_admin_password_hash(),
+        'user_password_hash': user_password_hash,
     }
 
 def create_default_config():
@@ -134,9 +222,13 @@ max_pdf_pages = 0
 
 # Максимальное количество строк Excel на лист (0 = без ограничения)
 max_excel_rows_per_sheet = 0
+
+# SHA-256 хэш пароля пользователя (по умолчанию пароль: 1234)
+user_password_hash = 03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4
 """
 
     with open("config.txt", "w", encoding="utf-8") as f:
         f.write(config_content)
+    save_admin_password_hash(DEFAULT_ADMIN_PASSWORD_HASH)
 
     print("Создан файл конфигурации config.txt с настройками по умолчанию.")

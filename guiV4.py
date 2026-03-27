@@ -7,7 +7,13 @@ import time  # Добавляем импорт модуля time
 import subprocess
 import sys
 import traceback
-from config_loader import load_config, create_default_config
+from config_loader import (
+    load_config,
+    create_default_config,
+    save_admin_password_hash,
+    make_role_password_hash,
+    verify_password_for_role,
+)
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
 from search_engine import search_files
@@ -22,10 +28,9 @@ HAS_EXCEL = False
 HAS_7Z = False
 HAS_RAR = False
 HAS_OCR = False
-APP_PASSWORD = "2407"
-INVALID_PASSWORD_CLOSE_MS = 300_000
-INVALID_PASSWORD_TICK_MS = 1000
 CRASH_LOG_FILE = "crash_log.txt"
+ADMIN_ROLE = "admin"
+USER_ROLE = "user"
 
 
 def write_crash_report(error_title, exc_value, exc_traceback):
@@ -43,12 +48,49 @@ def write_crash_report(error_title, exc_value, exc_traceback):
     return log_path
 
 
+def resolve_access_role(password, config):
+    """Определяет роль пользователя по введенному паролю."""
+    admin_hash = str(config.get("admin_password_hash", "")).strip()
+    user_hash = str(config.get("user_password_hash", "")).strip()
+
+    if verify_password_for_role(password, admin_hash, ADMIN_ROLE, conflicting_hash=user_hash):
+        return ADMIN_ROLE
+    if verify_password_for_role(password, user_hash, USER_ROLE, conflicting_hash=admin_hash):
+        return USER_ROLE
+    return None
+
+
+def prompt_for_access_role(root):
+    """Запрашивает пароль и возвращает роль пользователя."""
+    if not os.path.exists("config.txt"):
+        create_default_config()
+
+    auth_config = load_config()
+    while True:
+        entered_password = simpledialog.askstring(
+            "Вход в приложение",
+            "Введите пароль:",
+            show="*",
+            parent=root
+        )
+        if entered_password is None:
+            return None
+
+        access_role = resolve_access_role(entered_password, auth_config)
+        if access_role:
+            return access_role
+
+        messagebox.showerror("Ошибка входа", "Неверный пароль.", parent=root)
+
+
 class SearchApp:
-    def __init__(self, root):
+    def __init__(self, root, access_role):
         self.root = root
         self.root.title("Поиск файлов по ключевым словам")
         self.root.geometry("1000x800")
         self.root.minsize(900, 700)
+        self.access_role = access_role
+        self.is_admin = access_role == ADMIN_ROLE
 
         # Переменные для хранения состояний
         self.extension_options = ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z']
@@ -62,8 +104,6 @@ class SearchApp:
         self.is_closing = False
         self.config_dirty = False
         self._updating_threads_var = False
-        self.invalid_password_timer_id = None
-        self.invalid_password_deadline_ms = None
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
         self.theme_var = tk.StringVar(value="Светлая")
@@ -356,6 +396,18 @@ class SearchApp:
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
         self.theme_toggle_button.grid(row=6, column=1, sticky=tk.W, pady=(8, 3))
 
+        if self.is_admin:
+            ttk.Button(
+                settings_tab,
+                text="Смена пароля для администратора",
+                command=self.change_admin_password
+            ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(12, 3))
+            ttk.Button(
+                settings_tab,
+                text="Смена пароля для пользователя",
+                command=self.change_user_password
+            ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(3, 3))
+
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
 
@@ -367,6 +419,124 @@ class SearchApp:
         self.apply_theme(self.theme_var.get())
         self.config_dirty = True
         self.update_config(reload_after_save=False)
+
+    def change_user_password(self):
+        """Позволяет администратору изменить пароль пользователя."""
+        if not self.is_admin:
+            return
+
+        new_password = simpledialog.askstring(
+            "Смена пароля пользователя",
+            "Введите новый пароль для пользователя:",
+            show="*",
+            parent=self.root
+        )
+        if new_password is None:
+            return
+
+        new_password = new_password.strip()
+        if not new_password:
+            messagebox.showwarning("Предупреждение", "Пароль пользователя не может быть пустым.", parent=self.root)
+            return
+
+        confirm_password = simpledialog.askstring(
+            "Смена пароля пользователя",
+            "Повторите новый пароль:",
+            show="*",
+            parent=self.root
+        )
+        if confirm_password is None:
+            return
+
+        if new_password != confirm_password:
+            messagebox.showerror("Ошибка", "Пароли не совпадают.", parent=self.root)
+            return
+
+        new_hash = make_role_password_hash(new_password, USER_ROLE)
+        admin_hash = self.config['config'].get('admin_password_hash', '')
+        if verify_password_for_role(new_password, admin_hash, ADMIN_ROLE):
+            messagebox.showerror(
+                "Ошибка",
+                "Пароль пользователя должен отличаться от пароля администратора.",
+                parent=self.root
+            )
+            return
+
+        try:
+            self.config['config']['user_password_hash'] = new_hash
+            self.config_dirty = True
+            self.update_config(reload_after_save=True)
+            messagebox.showinfo("Успех", "Пароль пользователя успешно изменен.", parent=self.root)
+        except Exception as e:
+            self.report_runtime_error("Не удалось изменить пароль пользователя", e, show_dialog=True)
+
+    def change_admin_password(self):
+        """Позволяет администратору изменить пароль администратора."""
+        if not self.is_admin:
+            return
+
+        current_password = simpledialog.askstring(
+            "Смена пароля администратора",
+            "Введите текущий пароль администратора:",
+            show="*",
+            parent=self.root
+        )
+        if current_password is None:
+            return
+
+        admin_hash = self.config['config'].get('admin_password_hash', '')
+        if admin_hash and not verify_password_for_role(
+            current_password,
+            admin_hash,
+            ADMIN_ROLE,
+            conflicting_hash=self.config['config'].get('user_password_hash', '')
+        ):
+            messagebox.showerror("Ошибка", "Текущий пароль администратора введен неверно.", parent=self.root)
+            return
+
+        new_password = simpledialog.askstring(
+            "Смена пароля администратора",
+            "Введите новый пароль администратора:",
+            show="*",
+            parent=self.root
+        )
+        if new_password is None:
+            return
+
+        new_password = new_password.strip()
+        if not new_password:
+            messagebox.showwarning("Предупреждение", "Пароль администратора не может быть пустым.", parent=self.root)
+            return
+
+        confirm_password = simpledialog.askstring(
+            "Смена пароля администратора",
+            "Повторите новый пароль администратора:",
+            show="*",
+            parent=self.root
+        )
+        if confirm_password is None:
+            return
+
+        if new_password != confirm_password:
+            messagebox.showerror("Ошибка", "Пароли не совпадают.", parent=self.root)
+            return
+
+        new_hash = make_role_password_hash(new_password, ADMIN_ROLE)
+        user_hash = self.config['config'].get('user_password_hash', '')
+        if verify_password_for_role(new_password, user_hash, USER_ROLE):
+            messagebox.showerror(
+                "Ошибка",
+                "Пароль администратора должен отличаться от пароля пользователя.",
+                parent=self.root
+            )
+            return
+
+        try:
+            self.config['config']['admin_password_hash'] = new_hash
+            save_admin_password_hash(new_hash)
+            messagebox.showinfo("Успех", "Пароль администратора успешно изменен.", parent=self.root)
+        except Exception as e:
+            self.report_runtime_error("Не удалось изменить пароль администратора", e, show_dialog=True)
 
     def apply_theme(self, theme_name: str):
         style = ttk.Style()
@@ -999,6 +1169,7 @@ class SearchApp:
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
             # Новые параметры для тонкой настройки поиска
             'max_pdf_pages': self.max_pdf_pages_var.get(),
+            'user_password_hash': current_cfg.get('user_password_hash', ''),
         }
 
         # Сохраняем конфиг
@@ -1035,41 +1206,10 @@ class SearchApp:
             return
 
         try:
-            if self.invalid_password_timer_id is not None:
-                self.root.after_cancel(self.invalid_password_timer_id)
-                self.invalid_password_timer_id = None
-        except Exception:
-            pass
-
-        try:
             if self.config_dirty:
                 self.update_config(reload_after_save=False)
         finally:
             self.root.destroy()
-
-    def start_invalid_password_timer(self):
-        """Запускает обратный отсчет до автозакрытия при неверном пароле."""
-        self.invalid_password_deadline_ms = int(time.time() * 1000) + INVALID_PASSWORD_CLOSE_MS
-        self._update_invalid_password_timer()
-
-    def _update_invalid_password_timer(self):
-        """Обновляет таймер обратного отсчета при неверном пароле."""
-        if self.invalid_password_deadline_ms is None:
-            return
-
-        remaining_ms = self.invalid_password_deadline_ms - int(time.time() * 1000)
-        if remaining_ms <= 0:
-            self.invalid_password_timer_id = None
-            self.on_close()
-            return
-
-        total_seconds = max(0, remaining_ms // 1000)
-        minutes = total_seconds // 60
-        seconds = total_seconds % 60
-        timer_text = f"Ограниченный доступ. До закрытия: {minutes:02d}:{seconds:02d}"
-        self.current_file.set(timer_text)
-        self.root.title(f"Поиск файлов по ключевым словам [Ограниченный доступ {minutes:02d}:{seconds:02d}]")
-        self.invalid_password_timer_id = self.root.after(INVALID_PASSWORD_TICK_MS, self._update_invalid_password_timer)
 
     def save_results(self):
         """Сохранение результатов в файл"""
@@ -1094,16 +1234,12 @@ def main():
     """Основная функция"""
     root = tk.Tk()
     root.withdraw()
+    access_role = prompt_for_access_role(root)
+    if access_role is None:
+        root.destroy()
+        return
 
-    entered_password = simpledialog.askstring(
-        "Вход в приложение",
-        "Введите пароль:",
-        show="*",
-        parent=root
-    )
-    password_is_valid = entered_password == APP_PASSWORD
-
-    app = SearchApp(root)
+    app = SearchApp(root, access_role)
 
     def handle_unhandled_exception(error_title, exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -1156,16 +1292,6 @@ def main():
     )
 
     root.deiconify()
-
-    if not password_is_valid:
-        root.title("Поиск файлов по ключевым словам [Ограниченный доступ]")
-        messagebox.showwarning(
-            "Неверный пароль",
-            "Пароль неверный. Приложение будет закрыто через 5 минут.",
-            parent=root
-        )
-        app.start_invalid_password_timer()
-
     root.mainloop()
 
 
