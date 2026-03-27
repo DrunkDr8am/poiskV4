@@ -2,12 +2,26 @@ import os
 import configparser
 import hashlib
 import hmac
+import json
+import base64
 
 
 ADMIN_AUTH_FILE = "admin_auth.txt"
 HASH_SCHEME_VERSION = "v2"
 ADMIN_ROLE = "admin"
 USER_ROLE = "user"
+PERMISSIONS_SCHEME_VERSION = "permv1"
+PERMISSIONS_SIGNING_PEPPER = "zsearch-permissions-lock"
+USER_PERMISSION_DEFAULTS = {
+    'allow_user_change_extensions': True,
+    'allow_user_change_keywords': True,
+    'allow_user_change_threads': True,
+    'allow_user_change_max_file_size': True,
+    'allow_user_change_search_images': True,
+    'allow_user_change_max_pdf_pages': True,
+    'allow_user_change_theme': True,
+    'allow_user_results_context_menu': True,
+}
 
 
 def hash_password(password):
@@ -44,6 +58,83 @@ def verify_password_for_role(password, stored_hash, role, conflicting_hash=""):
         return False
 
     return True
+
+
+def get_default_user_permissions():
+    """Возвращает копию набора прав пользователя по умолчанию."""
+    return dict(USER_PERMISSION_DEFAULTS)
+
+
+def _build_permissions_signing_key(admin_password_hash):
+    """Строит ключ подписи прав на основе админского секрета."""
+    source = f"{admin_password_hash}|{PERMISSIONS_SIGNING_PEPPER}".encode("utf-8")
+    return hashlib.sha256(source).digest()
+
+
+def encode_user_permissions(permission_values, admin_password_hash):
+    """Упаковывает права пользователя в непрозрачный подписанный токен."""
+    normalized_permissions = {
+        key: bool(permission_values.get(key, default_value))
+        for key, default_value in USER_PERMISSION_DEFAULTS.items()
+    }
+    payload_json = json.dumps(normalized_permissions, sort_keys=True, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload_json.encode("utf-8")).decode("ascii")
+    signature = hmac.new(
+        _build_permissions_signing_key(admin_password_hash),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{PERMISSIONS_SCHEME_VERSION}.{payload_b64}.{signature}"
+
+
+def decode_user_permissions(encoded_permissions, admin_password_hash):
+    """Проверяет подпись и извлекает права пользователя из токена."""
+    encoded_permissions = str(encoded_permissions or "").strip()
+    if not encoded_permissions:
+        return None
+
+    try:
+        version, payload_b64, signature = encoded_permissions.split(".", 2)
+    except ValueError:
+        return None
+
+    if version != PERMISSIONS_SCHEME_VERSION:
+        return None
+
+    expected_signature = hmac.new(
+        _build_permissions_signing_key(admin_password_hash),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+
+    try:
+        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+        payload = json.loads(payload_json)
+    except Exception:
+        return None
+
+    return {
+        key: bool(payload.get(key, default_value))
+        for key, default_value in USER_PERMISSION_DEFAULTS.items()
+    }
+
+
+def load_user_permissions(config, admin_password_hash):
+    """Загружает права пользователя из токена либо из старого формата booleans."""
+    encoded_permissions = config.get("Settings", "user_permissions_token", fallback="").strip()
+    decoded_permissions = decode_user_permissions(encoded_permissions, admin_password_hash)
+    if decoded_permissions is not None:
+        return decoded_permissions
+
+    if encoded_permissions:
+        return {key: False for key in USER_PERMISSION_DEFAULTS}
+
+    legacy_permissions = {}
+    for key, default_value in USER_PERMISSION_DEFAULTS.items():
+        legacy_permissions[key] = config.getboolean("Settings", key, fallback=default_value)
+    return legacy_permissions
 
 
 DEFAULT_ADMIN_PASSWORD_HASH = make_role_password_hash("2407", ADMIN_ROLE)
@@ -139,6 +230,8 @@ def load_config(config_file="config.txt"):
         fallback=int(defaults['max_excel_rows_per_sheet']),
     )
     user_password_hash = config.get('Settings', 'user_password_hash', fallback=defaults['user_password_hash']).strip()
+    admin_password_hash = load_admin_password_hash()
+    user_permissions = load_user_permissions(config, admin_password_hash)
 
     # Очищаем значения от пробелов
     extensions = [ext.strip() for ext in extensions]
@@ -173,8 +266,10 @@ def load_config(config_file="config.txt"):
         'max_image_size_mb': max_image_size_mb,
         'max_pdf_pages': max_pdf_pages,
         'max_excel_rows_per_sheet': max_excel_rows_per_sheet,
-        'admin_password_hash': load_admin_password_hash(),
+        'admin_password_hash': admin_password_hash,
         'user_password_hash': user_password_hash,
+        'user_permissions_token': encode_user_permissions(user_permissions, admin_password_hash),
+        **user_permissions,
     }
 
 def create_default_config():
@@ -225,10 +320,14 @@ max_excel_rows_per_sheet = 0
 
 # SHA-256 хэш пароля пользователя (по умолчанию пароль: 1234)
 user_password_hash = 03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4
+
+# Подписанный токен прав пользователя
+user_permissions_token = {permissions_token}
 """
 
+    permissions_token = encode_user_permissions(get_default_user_permissions(), DEFAULT_ADMIN_PASSWORD_HASH)
     with open("config.txt", "w", encoding="utf-8") as f:
-        f.write(config_content)
+        f.write(config_content.format(permissions_token=permissions_token))
     save_admin_password_hash(DEFAULT_ADMIN_PASSWORD_HASH)
 
     print("Создан файл конфигурации config.txt с настройками по умолчанию.")

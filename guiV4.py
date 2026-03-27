@@ -13,6 +13,7 @@ from config_loader import (
     save_admin_password_hash,
     make_role_password_hash,
     verify_password_for_role,
+    encode_user_permissions,
 )
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -114,6 +115,17 @@ class SearchApp:
 
         # Загружаем конфигурацию ДО создания интерфейса
         self.config = self.load_configuration()
+        self.user_permission_vars = {
+            'extensions': tk.BooleanVar(value=self.config['config'].get('allow_user_change_extensions', True)),
+            'keywords': tk.BooleanVar(value=self.config['config'].get('allow_user_change_keywords', True)),
+            'threads': tk.BooleanVar(value=self.config['config'].get('allow_user_change_threads', True)),
+            'max_file_size': tk.BooleanVar(value=self.config['config'].get('allow_user_change_max_file_size', True)),
+            'search_images': tk.BooleanVar(value=self.config['config'].get('allow_user_change_search_images', True)),
+            'max_pdf_pages': tk.BooleanVar(value=self.config['config'].get('allow_user_change_max_pdf_pages', True)),
+            'theme': tk.BooleanVar(value=self.config['config'].get('allow_user_change_theme', True)),
+            'results_context_menu': tk.BooleanVar(value=self.config['config'].get('allow_user_results_context_menu', True)),
+        }
+        self.extension_checkbuttons = []
 
         # Проверяем зависимости
         self.check_dependencies()
@@ -201,6 +213,55 @@ class SearchApp:
         return {
             'config': config
         }
+
+    def mark_permissions_dirty(self):
+        """Помечает изменение пользовательских прав как несохраненное."""
+        self.config_dirty = True
+
+    def can_user_change(self, permission_key):
+        """Возвращает, разрешено ли текущему пользователю менять конкретную настройку."""
+        if self.is_admin:
+            return True
+        return bool(self.config['config'].get(permission_key, True))
+
+    def add_permission_checkbox(self, parent, row, permission_var, pady=3):
+        """Добавляет админскую галочку, определяющую доступность настройки для пользователя."""
+        if not self.is_admin:
+            return
+        ttk.Checkbutton(
+            parent,
+            text="Пользователь может менять",
+            variable=permission_var,
+            command=self.mark_permissions_dirty
+        ).grid(row=row, column=2, sticky=tk.W, padx=(12, 0), pady=pady)
+
+    def apply_user_permissions(self):
+        """Применяет ограничения интерфейса для пользователя по настройкам администратора."""
+        if self.can_user_change('allow_user_change_extensions'):
+            for checkbox in self.extension_checkbuttons:
+                checkbox.state(["!disabled"])
+        else:
+            for checkbox in self.extension_checkbuttons:
+                checkbox.state(["disabled"])
+
+        self.keywords_text.configure(
+            state=tk.NORMAL if self.can_user_change('allow_user_change_keywords') else tk.DISABLED
+        )
+        self.threads_spin.configure(
+            state=tk.NORMAL if self.can_user_change('allow_user_change_threads') else tk.DISABLED
+        )
+        self.max_size_spin.configure(
+            state=tk.NORMAL if self.can_user_change('allow_user_change_max_file_size') else tk.DISABLED
+        )
+        self.search_images_checkbox.state(
+            ["!disabled"] if self.can_user_change('allow_user_change_search_images') else ["disabled"]
+        )
+        self.max_pdf_pages_spin.configure(
+            state=tk.NORMAL if self.can_user_change('allow_user_change_max_pdf_pages') else tk.DISABLED
+        )
+        self.theme_toggle_button.state(
+            ["!disabled"] if self.can_user_change('allow_user_change_theme') else ["disabled"]
+        )
 
     def check_dependencies(self):
         """Проверка доступности опциональных зависимостей"""
@@ -339,6 +400,7 @@ class SearchApp:
 
         # ---------------- Настройки поиска ----------------
         settings_tab.columnconfigure(1, weight=1)
+        settings_tab.columnconfigure(2, weight=0)
         settings_tab.grid_anchor("nw")
 
         # Поля настроек идут по порядку
@@ -349,9 +411,10 @@ class SearchApp:
         for index, ext in enumerate(self.extension_options):
             row = index // columns
             col = index % columns
-            ttk.Checkbutton(extensions_frame, text=ext, variable=self.extension_vars[ext]).grid(
-                row=row, column=col, sticky=tk.W, padx=(0, 12), pady=2
-            )
+            checkbox = ttk.Checkbutton(extensions_frame, text=ext, variable=self.extension_vars[ext])
+            checkbox.grid(row=row, column=col, sticky=tk.W, padx=(0, 12), pady=2)
+            self.extension_checkbuttons.append(checkbox)
+        self.add_permission_checkbox(settings_tab, 0, self.user_permission_vars['extensions'])
 
         ttk.Label(settings_tab, text="Ключевые слова:").grid(row=1, column=0, sticky=tk.NW, pady=3)
         keywords_frame = ttk.Frame(settings_tab)
@@ -366,50 +429,65 @@ class SearchApp:
                     self.keywords_text.insert("1.0", f.read())
             except Exception:
                 pass
+        self.add_permission_checkbox(settings_tab, 1, self.user_permission_vars['keywords'])
 
         ttk.Label(settings_tab, text="Потоки:").grid(row=2, column=0, sticky=tk.W, pady=3)
-        auto_threads = self.get_auto_threads_count()
-        self.threads_var = tk.StringVar(value=str(auto_threads))
+        configured_threads = self.config['config'].get('threads', self.get_auto_threads_count())
+        self.threads_var = tk.StringVar(value=str(configured_threads))
         self.threads_var.trace_add("write", self.on_threads_var_change)
-        threads_spin = ttk.Spinbox(
+        self.threads_spin = ttk.Spinbox(
             settings_tab, from_=1, to=self.get_max_threads_count(), textvariable=self.threads_var, width=8
         )
-        threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
+        self.threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
+        self.add_permission_checkbox(settings_tab, 2, self.user_permission_vars['threads'])
 
         ttk.Label(settings_tab, text="Макс. размер файла (МБ):").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
-        max_size_spin = ttk.Spinbox(settings_tab, from_=1, to=1000, textvariable=self.max_size_var, width=8)
-        max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
+        self.max_size_spin = ttk.Spinbox(settings_tab, from_=1, to=1000, textvariable=self.max_size_var, width=8)
+        self.max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
+        self.add_permission_checkbox(settings_tab, 3, self.user_permission_vars['max_file_size'])
 
         self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
         ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=4, column=0, sticky=tk.W, pady=3)
-        ttk.Checkbutton(settings_tab, text="Включить OCR", variable=self.search_images_var).grid(
+        self.search_images_checkbox = ttk.Checkbutton(settings_tab, text="Включить OCR", variable=self.search_images_var)
+        self.search_images_checkbox.grid(
             row=4, column=1, sticky=tk.W, pady=3
         )
+        self.add_permission_checkbox(settings_tab, 4, self.user_permission_vars['search_images'])
 
         ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=5, column=0, sticky=tk.W, pady=3)
         self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
-        max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
-        max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
+        self.max_pdf_pages_spin = ttk.Spinbox(
+            settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10
+        )
+        self.max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
+        self.add_permission_checkbox(settings_tab, 5, self.user_permission_vars['max_pdf_pages'])
 
         ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=6, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
         self.theme_toggle_button.grid(row=6, column=1, sticky=tk.W, pady=(8, 3))
+        self.add_permission_checkbox(settings_tab, 6, self.user_permission_vars['theme'], pady=(8, 3))
+
+        if self.is_admin:
+            ttk.Label(settings_tab, text="ПКМ по таблице результатов:").grid(row=7, column=0, sticky=tk.W, pady=(8, 3))
+            ttk.Label(settings_tab, text="Открывать контекстное меню").grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+            self.add_permission_checkbox(settings_tab, 7, self.user_permission_vars['results_context_menu'], pady=(8, 3))
 
         if self.is_admin:
             ttk.Button(
                 settings_tab,
                 text="Смена пароля для администратора",
                 command=self.change_admin_password
-            ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(12, 3))
+            ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(12, 3))
             ttk.Button(
                 settings_tab,
                 text="Смена пароля для пользователя",
                 command=self.change_user_password
-            ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(3, 3))
+            ).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(3, 3))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
+        self.apply_user_permissions()
 
     def toggle_theme(self):
         if self.theme_var.get() == "Светлая":
@@ -859,6 +937,9 @@ class SearchApp:
 
     def show_results_context_menu(self, event):
         """Показывает контекстное меню для строки таблицы результатов."""
+        if not self.can_user_change('allow_user_results_context_menu'):
+            return
+
         item_id = self.results_table.identify_row(event.y)
         if not item_id:
             return
@@ -912,8 +993,7 @@ class SearchApp:
             messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
             return
 
-        # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
-        self.threads_var.set(str(self.get_auto_threads_count()))
+        # Нормализуем текущее значение потоков, заданное в настройках
         self.normalize_threads_value()
 
         extensions = self.get_selected_extensions()
@@ -1152,6 +1232,17 @@ class SearchApp:
 
         current_cfg = self.config['config']
         threads_count = self.normalize_threads_value()
+        permission_values = {
+            'allow_user_change_extensions': self.user_permission_vars['extensions'].get(),
+            'allow_user_change_keywords': self.user_permission_vars['keywords'].get(),
+            'allow_user_change_threads': self.user_permission_vars['threads'].get(),
+            'allow_user_change_max_file_size': self.user_permission_vars['max_file_size'].get(),
+            'allow_user_change_search_images': self.user_permission_vars['search_images'].get(),
+            'allow_user_change_max_pdf_pages': self.user_permission_vars['max_pdf_pages'].get(),
+            'allow_user_change_theme': self.user_permission_vars['theme'].get(),
+            'allow_user_results_context_menu': self.user_permission_vars['results_context_menu'].get(),
+        }
+        permissions_token = encode_user_permissions(permission_values, current_cfg.get('admin_password_hash', ''))
 
         # Обновляем конфиг
         config['Settings'] = {
@@ -1170,6 +1261,7 @@ class SearchApp:
             # Новые параметры для тонкой настройки поиска
             'max_pdf_pages': self.max_pdf_pages_var.get(),
             'user_password_hash': current_cfg.get('user_password_hash', ''),
+            'user_permissions_token': permissions_token,
         }
 
         # Сохраняем конфиг
