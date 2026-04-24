@@ -9,9 +9,10 @@ import sys
 import traceback
 import json
 import hashlib
+import tkinter.font as tkfont
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
-from file_processing import load_keywords
+from file_processing import load_keywords, run_pdf_worker_cli
 from search_engine import search_files
 from configparser import ConfigParser
 
@@ -103,6 +104,7 @@ class SearchApp:
         self.processed_files = 0
         self.search_start_time = None  # Время начала поиска
         self.search_end_time = None  # Время окончания поиска
+        self.max_result_file_text_px = 0
 
         # Загружаем конфигурацию ДО создания интерфейса
         self.config = self.load_configuration()
@@ -361,12 +363,16 @@ class SearchApp:
         self.results_table = ttk.Treeview(results_frame, columns=("keywords", "file"), show="headings", height=14)
         self.results_table.heading("keywords", text="Найденные слова")
         self.results_table.heading("file", text="Ссылка на файл")
-        self.results_table.column("keywords", width=150, minwidth=100, stretch=True, anchor=tk.W)
-        self.results_table.column("file", width=850, minwidth=300, stretch=True, anchor=tk.W)
+        self.results_table.column("keywords", width=150, minwidth=100, stretch=False, anchor=tk.W)
+        self.results_table.column("file", width=850, minwidth=300, stretch=False, anchor=tk.W)
         results_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_table.yview)
-        self.results_table.configure(yscrollcommand=results_scrollbar.set)
+        results_h_scrollbar = ttk.Scrollbar(results_frame, orient=tk.HORIZONTAL, command=self.results_table.xview)
+        self.results_table.configure(yscrollcommand=results_scrollbar.set, xscrollcommand=results_h_scrollbar.set)
         self.results_table.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         results_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        results_h_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        self.results_h_scrollbar = results_h_scrollbar
+        self.results_h_scrollbar.grid_remove()
         self.hovered_result_item = None
         self.results_context_menu = tk.Menu(self.root, tearoff=0)
         self.results_context_menu.add_command(label="Перейти к расположению файла", command=self.open_result_location)
@@ -450,7 +456,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.1 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.2 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=10, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -974,6 +980,9 @@ class SearchApp:
         for item in self.results_table.get_children():
             self.results_table.delete(item)
         self.hovered_result_item = None
+        self.max_result_file_text_px = 0
+        self.results_table.column("file", width=850)
+        self._update_results_h_scrollbar_visibility()
 
         self.progress_value.set(0)
         self.current_file.set("")
@@ -1014,15 +1023,43 @@ class SearchApp:
     def add_live_result(self, file_path, keywords):
         """Добавление найденного результата в таблицу в реальном времени."""
         keywords_str = ', '.join(sorted(keywords)) if keywords else ''
-        self.safe_after(0, self.results_table.insert, '', tk.END, values=(keywords_str, file_path))
+        self.safe_after(0, self._insert_live_result_row, keywords_str, file_path)
+
+    def _insert_live_result_row(self, keywords_str, file_path):
+        """Вставляет строку результата и подстраивает ширину колонки ссылки."""
+        self.results_table.insert('', tk.END, values=(keywords_str, file_path))
+        self._update_file_column_width_for_path(file_path)
+
+    def _update_file_column_width_for_path(self, file_path):
+        """Расширяет колонку ссылки по фактической длине текста."""
+        try:
+            table_font = tkfont.nametofont("TkDefaultFont")
+            text_px = table_font.measure(str(file_path)) + 40
+            if text_px > self.max_result_file_text_px:
+                self.max_result_file_text_px = text_px
+                new_width = max(850, min(6000, self.max_result_file_text_px))
+                self.results_table.column("file", width=new_width)
+            self._update_results_h_scrollbar_visibility()
+        except Exception:
+            pass
+
+    def _update_results_h_scrollbar_visibility(self):
+        """Показывает нижний скролл только если ссылка выходит за видимую ширину."""
+        if not hasattr(self, "results_h_scrollbar"):
+            return
+        table_width = self.results_table.winfo_width()
+        if table_width <= 1:
+            return
+        total_columns_width = int(self.results_table.column("keywords", "width")) + int(self.results_table.column("file", "width"))
+        if total_columns_width > table_width:
+            self.results_h_scrollbar.grid()
+        else:
+            self.results_h_scrollbar.grid_remove()
 
     def on_results_table_resize(self, event):
-        """Поддерживает пропорцию колонок 15% / 85%."""
-        total_width = max(1, event.width - 4)
-        keywords_width = max(100, int(total_width * 0.15))
-        file_width = max(300, total_width - keywords_width)
-        self.results_table.column("keywords", width=keywords_width)
-        self.results_table.column("file", width=file_width)
+        """При ресайзе обновляет видимость горизонтального скролла."""
+        _ = event
+        self._update_results_h_scrollbar_visibility()
 
     def open_result_file(self, event):
         """Открытие файла из выбранной строки таблицы по двойному клику."""
@@ -1673,4 +1710,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--pdf-worker":
+        raise SystemExit(run_pdf_worker_cli(sys.argv[2:]))
     main()

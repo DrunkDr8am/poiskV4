@@ -6,6 +6,9 @@ from io import BytesIO
 from typing import Set, Dict, List
 import logging
 import re
+import json
+import subprocess
+import sys
 
 # Глобальные переменные для хранения ключевых слов
 # KEYWORDS_LOWER содержит все ключевые слова в нижнем регистре
@@ -20,6 +23,107 @@ MAX_SAFE_WINDOWS_NAME_LENGTH = 180
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.jpe', '.jfif', '.bmp', '.gif', '.tif', '.tiff', '.webp', '.ico')
 WORD_EXTENSIONS = ('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')
 EXCEL_EXTENSIONS = ('.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm')
+PDF_SUBPROCESS_TIMEOUT_SEC = 120
+
+
+def _search_in_text_worker(text: str, words: Set[str], substr: Set[str]) -> Set[str]:
+    """Локальный поиск для subprocess-воркера PDF."""
+    if not text:
+        return set()
+    text_lower = text.lower()
+    found = set()
+    if words:
+        token_set = set(re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text_lower))
+        for kw in words:
+            if kw in token_set:
+                found.add(kw)
+    if substr:
+        for kw in substr:
+            if kw in text_lower:
+                found.add(kw)
+    return found
+
+
+def run_pdf_worker_cli(argv: List[str]) -> int:
+    """CLI-воркер обработки PDF. Возвращает код завершения процесса."""
+    if len(argv) < 5:
+        print(json.dumps({"ok": False, "error": "invalid_arguments"}), end="")
+        return 2
+
+    pdf_path = argv[0]
+    try:
+        config = json.loads(argv[1])
+        keywords_words = set(json.loads(argv[2]))
+        keywords_substr = set(json.loads(argv[3]))
+        keywords_all = set(json.loads(argv[4]))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"bad_json: {e}"}), end="")
+        return 2
+
+    found = set()
+    try:
+        import fitz  # type: ignore
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"fitz_import: {e}"}), end="")
+        return 2
+
+    try:
+        with fitz.open(pdf_path) as doc:
+            max_pages = int(config.get('max_pdf_pages', 0) or 0)
+            has_ocr = bool(config.get('has_ocr', False))
+            ocr_lang = config.get('tesseract_languages', 'rus')
+            ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
+            ocr_ready = False
+            pytesseract = None
+            Image = None
+            if has_ocr:
+                try:
+                    import pytesseract as _pytesseract  # type: ignore
+                    from PIL import Image as _Image  # type: ignore
+                    pytesseract = _pytesseract
+                    Image = _Image
+                    ocr_ready = True
+                except Exception:
+                    ocr_ready = False
+
+            for page_index, page in enumerate(doc):
+                if max_pages > 0 and page_index >= max_pages:
+                    break
+
+                text = page.get_text()
+                found.update(_search_in_text_worker(text, keywords_words, keywords_substr))
+                if keywords_all and found.issuperset(keywords_all):
+                    break
+
+                if ocr_ready:
+                    for img in page.get_images(full=True):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        if not base_image or "image" not in base_image:
+                            continue
+                        try:
+                            image_data = BytesIO(base_image["image"])
+                            pil_img = Image.open(image_data)
+                            if pil_img.mode == 'P' and 'transparency' in pil_img.info:
+                                pil_img = pil_img.convert('RGBA')
+                            if pil_img.mode == 'RGBA':
+                                pil_img = pil_img.convert('RGB')
+                            elif pil_img.mode not in ('RGB', 'L'):
+                                pil_img = pil_img.convert('RGB')
+                            ocr_text = pytesseract.image_to_string(pil_img, lang=ocr_lang, config=ocr_cfg)
+                            found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
+                            if keywords_all and found.issuperset(keywords_all):
+                                break
+                        except Exception:
+                            continue
+                    if keywords_all and found.issuperset(keywords_all):
+                        break
+
+        print(json.dumps({"ok": True, "found": sorted(found)}), end="")
+        return 0
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}), end="")
+        return 1
 
 
 def get_long_path_reason(file_path: str, config: dict = None) -> str:
@@ -192,43 +296,59 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
 
 
 def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
-    """Обработка PDF файлов"""
+    """Обработка PDF файлов в отдельном процессе для защиты от падений fitz."""
+    payload_config = {
+        "max_pdf_pages": int(config.get("max_pdf_pages", 0) or 0),
+        "has_ocr": bool(config.get("has_ocr", False)),
+        "tesseract_languages": config.get("tesseract_languages", "rus"),
+        "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+    }
+
+    worker_args = [
+        pdf_path,
+        json.dumps(payload_config, ensure_ascii=False),
+        json.dumps(sorted(KEYWORDS_WORDS), ensure_ascii=False),
+        json.dumps(sorted(KEYWORDS_SUBSTR), ensure_ascii=False),
+        json.dumps(sorted(KEYWORDS_LOWER), ensure_ascii=False),
+    ]
+
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--pdf-worker", *worker_args]
+    else:
+        command = [sys.executable, os.path.abspath(__file__), "--pdf-worker", *worker_args]
+
     try:
-        import fitz  # PyMuPDF
-    except ImportError:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=PDF_SUBPROCESS_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        logging.error(f"Таймаут обработки PDF в subprocess: {pdf_path}")
+        return set()
+    except Exception as e:
+        logging.error(f"Не удалось запустить subprocess для PDF {pdf_path}: {e}")
         return set()
 
-    found = set()
-    try:
-        with fitz.open(pdf_path) as doc:
-            max_pages = int(config.get('max_pdf_pages', 0) or 0)
-            for page_index, page in enumerate(doc):
-                # 0 означает "без ограничения"
-                if max_pages > 0 and page_index >= max_pages:
-                    logging.info(
-                        f"Пропуск оставшихся страниц PDF {pdf_path} (достигнут лимит {max_pages} страниц)"
-                    )
-                    break
-                # Текст со страницы
-                text = page.get_text()
-                found.update(search_in_text(text))
-                if KEYWORDS_LOWER and found.issuperset(KEYWORDS_LOWER):
-                    logging.info(f"Ранний останов PDF {pdf_path} (найдены все ключевые слова)")
-                    return found
+    if proc.returncode != 0:
+        stderr_text = (proc.stderr or "").strip()
+        stdout_text = (proc.stdout or "").strip()
+        details = stderr_text or stdout_text or f"returncode={proc.returncode}"
+        logging.error(f"Subprocess обработки PDF завершился с ошибкой для {pdf_path}: {details}")
+        return set()
 
-                # Обработка изображений (только если есть OCR)
-                for img in page.get_images(full=True):
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    if base_image and "image" in base_image:
-                        image_data = BytesIO(base_image["image"])
-                        found.update(search_in_image(image_data, config))
-                        if KEYWORDS_LOWER and found.issuperset(KEYWORDS_LOWER):
-                            logging.info(f"Ранний останов PDF {pdf_path} (найдены все ключевые слова)")
-                            return found
-    except Exception as e:
-        logging.error(f"Ошибка обработки PDF {pdf_path}: {e}")
-    return found
+    try:
+        response = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        logging.error(f"Некорректный ответ subprocess для PDF {pdf_path}")
+        return set()
+
+    if not response.get("ok", False):
+        logging.error(f"Ошибка обработки PDF {pdf_path} в subprocess: {response.get('error', 'unknown')}")
+        return set()
+
+    return set(response.get("found", []))
 
 
 def search_in_docx(docx_path: str, config: dict) -> Set[str]:
@@ -555,3 +675,8 @@ def process_file(file_path: str, extensions: List[str], max_file_size: int, conf
     """Обратная совместимость: возвращает только словарь совпадений."""
     result, _, _, _ = process_file_with_meta(file_path, extensions, max_file_size, config)
     return result
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--pdf-worker":
+        raise SystemExit(run_pdf_worker_cli(sys.argv[2:]))
