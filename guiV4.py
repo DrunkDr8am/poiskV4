@@ -7,6 +7,8 @@ import time  # Добавляем импорт модуля time
 import subprocess
 import sys
 import traceback
+import json
+import hashlib
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords
@@ -22,10 +24,12 @@ HAS_EXCEL = False
 HAS_7Z = False
 HAS_RAR = False
 HAS_OCR = False
-APP_PASSWORD = "2407"
+APP_PASSWORD = "5331"
 INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
 CRASH_LOG_FILE = "crash_log.txt"
+SEARCH_STATE_FILE = "search_state.json"
+SEARCH_STATE_VERSION = 1
 
 
 def write_crash_report(error_title, exc_value, exc_traceback):
@@ -51,7 +55,13 @@ class SearchApp:
         self.root.minsize(900, 700)
 
         # Переменные для хранения состояний
-        self.extension_options = ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z']
+        self.extension_options = [
+            '*.txt', '*.pdf',
+            '*.doc', '*.docx', '*.docm', '*.dot', '*.dotx', '*.dotm',
+            '*.xls', '*.xlsx', '*.xlsm', '*.xlt', '*.xltx', '*.xltm',
+            '*.jpg', '*.jpeg', '*.jpe', '*.jfif', '*.png', '*.bmp', '*.gif', '*.tif', '*.tiff', '*.webp', '*.ico',
+            '*.zip', '*.rar', '*.7z'
+        ]
         self.extension_vars = {ext: tk.BooleanVar(value=False) for ext in self.extension_options}
         self.directories_list = []
         self.is_searching = False
@@ -64,6 +74,28 @@ class SearchApp:
         self._updating_threads_var = False
         self.invalid_password_timer_id = None
         self.invalid_password_deadline_ms = None
+        self.search_file_handler = None
+        self.search_state_lock = threading.Lock()
+        self.active_search_state = None
+        self.resume_processed_files = set()
+        self.resume_start_count = 0
+        self.search_session_status_var = tk.StringVar(value="Статус сессии: нет данных")
+        self.search_session_remaining_var = tk.StringVar(value="Осталось файлов: -")
+        self.search_session_last_file_var = tk.StringVar(value="Последний файл: -")
+        self.dashboard_processed_var = tk.StringVar(value="0")
+        self.dashboard_found_var = tk.StringVar(value="0")
+        self.dashboard_skipped_var = tk.StringVar(value="0")
+        self.dashboard_errors_var = tk.StringVar(value="0")
+        self.dashboard_found = 0
+        self.dashboard_skipped = 0
+        self.dashboard_errors = 0
+        self.dashboard_skip_reasons = {
+            "long_path": 0,
+            "large_file": 0,
+            "module_unavailable": 0,
+            "read_error": 0,
+            "other": 0,
+        }
         self.progress_value = tk.DoubleVar(value=0.0)
         self.current_file = tk.StringVar(value="")
         self.theme_var = tk.StringVar(value="Светлая")
@@ -81,6 +113,7 @@ class SearchApp:
         # Создаем интерфейс
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.refresh_search_session_ui()
 
         # Центрируем окно
         self.center_window()
@@ -217,7 +250,7 @@ class SearchApp:
 
         # ---------------- Поиск ----------------
         search_tab.columnconfigure(1, weight=1)
-        search_tab.rowconfigure(4, weight=1)
+        search_tab.rowconfigure(5, weight=1)
 
         ttk.Label(search_tab, text="Директории для поиска:").grid(row=0, column=0, sticky=tk.NW, pady=5)
         dir_frame = ttk.Frame(search_tab)
@@ -255,16 +288,63 @@ class SearchApp:
                 self.directories_list.append(directory)
                 self.dirs_listbox.insert(tk.END, directory)
 
-        ttk.Label(search_tab, text="Прогресс:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(search_tab, text="Дашборд:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        dashboard_frame = ttk.Frame(search_tab, style="DashboardWrap.TFrame")
+        dashboard_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        for col_idx in range(4):
+            dashboard_frame.columnconfigure(col_idx, weight=1)
+
+        dashboard_cards = [
+            ("Проверено", self.dashboard_processed_var),
+            ("Найдено", self.dashboard_found_var),
+            ("Пропущено", self.dashboard_skipped_var),
+            ("Ошибки", self.dashboard_errors_var),
+        ]
+        for index, (title, value_var) in enumerate(dashboard_cards):
+            card = ttk.Frame(dashboard_frame, style="DashboardCard.TFrame", padding=(10, 8))
+            card.grid(row=0, column=index, sticky=(tk.W, tk.E), padx=4)
+            title_label = ttk.Label(card, text=title, style="DashboardCardTitle.TLabel")
+            title_label.grid(row=0, column=0, sticky=tk.W)
+            value_label = ttk.Label(card, textvariable=value_var, style="DashboardCardValue.TLabel")
+            value_label.grid(
+                row=1, column=0, sticky=tk.W, pady=(4, 0)
+            )
+            if title == "Пропущено":
+                self.dashboard_skipped_card = card
+                self.dashboard_skipped_card.configure(cursor="hand2")
+                card.bind("<Button-1>", self.show_skip_details)
+                title_label.bind("<Button-1>", self.show_skip_details)
+                value_label.bind("<Button-1>", self.show_skip_details)
+
+        ttk.Label(search_tab, text="Прогресс:").grid(row=2, column=0, sticky=tk.W, pady=5)
         progress_frame = ttk.Frame(search_tab)
-        progress_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        progress_frame.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5)
         progress_frame.columnconfigure(0, weight=1)
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_value, maximum=100)
         self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
         ttk.Label(progress_frame, textvariable=self.current_file).grid(row=1, column=0, sticky=(tk.W, tk.E))
 
+        session_cards_frame = ttk.Frame(progress_frame, style="SessionCardsWrap.TFrame")
+        session_cards_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(8, 0))
+        session_cards_frame.columnconfigure(0, weight=1)
+        session_cards_frame.columnconfigure(1, weight=1)
+
+        status_card = ttk.Frame(session_cards_frame, style="SessionCard.TFrame", padding=(12, 8))
+        status_card.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 6))
+        ttk.Label(status_card, text="Статус сессии", style="SessionCardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(status_card, textvariable=self.search_session_status_var, style="SessionCardValue.TLabel").grid(
+            row=1, column=0, sticky=tk.W, pady=(4, 0)
+        )
+
+        remaining_card = ttk.Frame(session_cards_frame, style="SessionCard.TFrame", padding=(12, 8))
+        remaining_card.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(6, 0))
+        ttk.Label(remaining_card, text="Осталось файлов", style="SessionCardTitle.TLabel").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(remaining_card, textvariable=self.search_session_remaining_var, style="SessionCardValue.TLabel").grid(
+            row=1, column=0, sticky=tk.W, pady=(4, 0)
+        )
+
         button_frame = ttk.Frame(search_tab)
-        button_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=10)
         self.start_button = ttk.Button(button_frame, text="Начать поиск", command=self.start_search)
         self.start_button.pack(side=tk.LEFT, padx=5)
         self.pause_button = ttk.Button(button_frame, text="Пауза", command=self.toggle_pause, state=tk.DISABLED)
@@ -273,9 +353,9 @@ class SearchApp:
         self.stop_button.pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Сохранить результаты", command=self.save_results).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(search_tab, text="Результаты поиска:").grid(row=3, column=0, sticky=tk.NW, pady=5)
+        ttk.Label(search_tab, text="Результаты поиска:").grid(row=4, column=0, sticky=tk.NW, pady=5)
         results_frame = ttk.Frame(search_tab)
-        results_frame.grid(row=3, column=1, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        results_frame.grid(row=4, column=1, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         results_frame.columnconfigure(0, weight=1)
         results_frame.rowconfigure(0, weight=1)
         self.results_table = ttk.Treeview(results_frame, columns=("keywords", "file"), show="headings", height=14)
@@ -299,6 +379,7 @@ class SearchApp:
 
         # ---------------- Настройки поиска ----------------
         settings_tab.columnconfigure(1, weight=1)
+        settings_tab.rowconfigure(9, weight=1)
         settings_tab.grid_anchor("nw")
 
         # Поля настроек идут по порядку
@@ -336,9 +417,9 @@ class SearchApp:
         )
         threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Макс. размер файла (МБ):").grid(row=3, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. размер файла (МБ, 0=без лимита):").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
-        max_size_spin = ttk.Spinbox(settings_tab, from_=1, to=1000, textvariable=self.max_size_var, width=8)
+        max_size_spin = ttk.Spinbox(settings_tab, from_=0, to=1000, textvariable=self.max_size_var, width=8)
         max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
 
         self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
@@ -352,9 +433,26 @@ class SearchApp:
         max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
         max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=6, column=0, sticky=tk.W, pady=(8, 3))
+        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
+        self.max_path_length_var = tk.StringVar(value=str(self.config['config'].get('max_path_length', 240)))
+        max_path_spin = ttk.Spinbox(settings_tab, from_=0, to=10000, textvariable=self.max_path_length_var, width=10)
+        max_path_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=7, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
-        self.theme_toggle_button.grid(row=6, column=1, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+
+        ttk.Button(
+            settings_tab,
+            text="Сбросить состояние поиска",
+            command=self.reset_search_state
+        ).grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
+
+        footer_info = ttk.Label(
+            settings_tab,
+            text="Версия: v.2.0.1 | Автор: Андрей ОБИС 2026"
+        )
+        footer_info.grid(row=10, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
@@ -436,6 +534,29 @@ class SearchApp:
         style.configure("Treeview.Heading", background=colors["panel"], foreground=colors["fg"])
         style.configure("TProgressbar", troughcolor=colors["panel"], background=colors["accent"])
         style.configure("TCombobox", fieldbackground=colors["entry_bg"], background=colors["panel"], foreground=colors["fg"])
+        style.configure("DashboardWrap.TFrame", background=colors["bg"])
+        style.configure("DashboardCard.TFrame", background=colors["panel"], borderwidth=1, relief="solid")
+        style.configure("DashboardCardTitle.TLabel", background=colors["panel"], foreground=colors["fg"], font=("Segoe UI", 9))
+        style.configure("DashboardCardValue.TLabel", background=colors["panel"], foreground=colors["accent"], font=("Segoe UI", 10, "bold"))
+        style.configure("SessionCardsWrap.TFrame", background=colors["bg"])
+        style.configure(
+            "SessionCard.TFrame",
+            background=colors["panel"],
+            borderwidth=1,
+            relief="solid"
+        )
+        style.configure(
+            "SessionCardTitle.TLabel",
+            background=colors["panel"],
+            foreground=colors["fg"],
+            font=("Segoe UI", 9)
+        )
+        style.configure(
+            "SessionCardValue.TLabel",
+            background=colors["panel"],
+            foreground=colors["accent"],
+            font=("Segoe UI", 10, "bold")
+        )
 
         self.dirs_listbox.configure(bg=colors["entry_bg"], fg=colors["fg"], selectbackground=colors["accent"], selectforeground="#ffffff")
         self.keywords_text.configure(bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
@@ -452,6 +573,286 @@ class SearchApp:
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
         logger.setLevel(logging.INFO)
+
+    def build_search_signature(self, extensions, keywords_text, max_file_size):
+        """Формирует подпись параметров поиска для проверки совместимости resume-сессии."""
+        signature_payload = {
+            "directories": sorted(os.path.normcase(os.path.normpath(path)) for path in self.directories_list),
+            "extensions": sorted(ext.lower() for ext in extensions),
+            "keywords_sha256": hashlib.sha256(keywords_text.encode("utf-8")).hexdigest(),
+            "max_file_size": max_file_size,
+            "max_path_length": str(self.max_path_length_var.get()),
+            "search_images": bool(self.search_images_var.get()),
+            "max_pdf_pages": str(self.max_pdf_pages_var.get()),
+        }
+        payload_json = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+    def load_search_state(self):
+        """Читает файл состояния предыдущего поиска."""
+        if not os.path.exists(SEARCH_STATE_FILE):
+            return None
+        try:
+            with open(SEARCH_STATE_FILE, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            if not isinstance(state, dict):
+                return None
+            if state.get("version") != SEARCH_STATE_VERSION:
+                return None
+            return state
+        except Exception as exc:
+            logging.warning(f"Не удалось прочитать {SEARCH_STATE_FILE}: {exc}")
+            return None
+
+    def save_search_state(self):
+        """Сохраняет текущее состояние поиска атомарно."""
+        with self.search_state_lock:
+            if not self.active_search_state:
+                return
+            state_copy = dict(self.active_search_state)
+        tmp_path = f"{SEARCH_STATE_FILE}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as tmp_file:
+                json.dump(state_copy, tmp_file, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, SEARCH_STATE_FILE)
+        except Exception as exc:
+            logging.error(f"Не удалось сохранить {SEARCH_STATE_FILE}: {exc}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def format_session_status(status):
+        status_map = {
+            "running": "выполняется",
+            "stopped": "остановлена",
+            "completed": "завершена",
+            "crashed": "завершилась с ошибкой",
+        }
+        return status_map.get(status, "нет данных")
+
+    def update_search_session_labels(self, state):
+        """Обновляет блок статуса сессии в интерфейсе."""
+        if not state:
+            self.search_session_status_var.set("нет данных")
+            self.search_session_remaining_var.set("-")
+            self.search_session_last_file_var.set("Последний файл: -")
+            return
+
+        status = self.format_session_status(state.get("status"))
+        remaining = state.get("remaining_count", "-")
+        last_file = state.get("last_processed_file") or "-"
+
+        self.search_session_status_var.set(status)
+        self.search_session_remaining_var.set(str(remaining))
+        if len(last_file) > 120:
+            last_file = "..." + last_file[-117:]
+        self.search_session_last_file_var.set(f"Последний файл: {last_file}")
+
+    def refresh_search_session_ui(self):
+        """Подтягивает состояние поиска из памяти/файла и обновляет блок статуса."""
+        state = None
+        with self.search_state_lock:
+            if self.active_search_state:
+                state = dict(self.active_search_state)
+        if state is None:
+            state = self.load_search_state()
+        self.update_search_session_labels(state)
+        if state:
+            self.reset_dashboard(
+                state.get("total_files", 0),
+                state.get("processed_count", 0),
+                state.get("matched_count", 0),
+                state.get("skipped_count", 0),
+                state.get("error_count", 0),
+            )
+            skip_reasons = state.get("skip_reasons", {})
+            if isinstance(skip_reasons, dict):
+                for reason_key in self.dashboard_skip_reasons:
+                    self.dashboard_skip_reasons[reason_key] = int(skip_reasons.get(reason_key, 0))
+        else:
+            self.reset_dashboard(0, 0, 0, 0, 0)
+
+    def reset_dashboard(self, total_files, processed_count=0, found_count=0, skipped_count=0, error_count=0):
+        """Сбрасывает счетчики дашборда перед запуском/возобновлением."""
+        self.processed_files = max(0, int(processed_count))
+        self.dashboard_found = max(0, int(found_count))
+        self.dashboard_skipped = max(0, int(skipped_count))
+        self.dashboard_errors = max(0, int(error_count))
+        self.total_files = max(0, int(total_files))
+        self.dashboard_skip_reasons = {
+            "long_path": 0,
+            "large_file": 0,
+            "module_unavailable": 0,
+            "read_error": 0,
+            "other": 0,
+        }
+        self.update_dashboard_labels()
+
+    def update_dashboard_labels(self):
+        """Обновляет значения карточек дашборда."""
+        self.dashboard_processed_var.set(str(self.processed_files))
+        self.dashboard_found_var.set(str(self.dashboard_found))
+        self.dashboard_skipped_var.set(str(self.dashboard_skipped))
+        self.dashboard_errors_var.set(str(self.dashboard_errors))
+
+    def show_skip_details(self, _event=None):
+        """Показывает детальную разбивку причин пропусков."""
+        reason_names = {
+            "long_path": "Слишком длинный путь",
+            "large_file": "Слишком большой файл",
+            "module_unavailable": "Модуль недоступен",
+            "read_error": "Ошибка чтения",
+            "other": "Другая причина",
+        }
+        lines = [
+            f"{reason_names[key]}: {self.dashboard_skip_reasons.get(key, 0)}"
+            for key in ("long_path", "large_file", "module_unavailable", "read_error", "other")
+        ]
+        details_text = "Детализация пропущенных файлов:\n\n" + "\n".join(lines)
+        messagebox.showinfo("Причины пропуска", details_text, parent=self.root)
+
+    def reset_search_state(self):
+        """Удаляет сохраненное состояние поиска и сбрасывает UI-блок."""
+        if self.is_searching:
+            messagebox.showwarning("Нельзя выполнить", "Остановите текущий поиск перед сбросом состояния.")
+            return
+
+        try:
+            if os.path.exists(SEARCH_STATE_FILE):
+                os.remove(SEARCH_STATE_FILE)
+            tmp_path = f"{SEARCH_STATE_FILE}.tmp"
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError as exc:
+            messagebox.showerror("Ошибка", f"Не удалось сбросить состояние поиска:\n{exc}")
+            return
+
+        with self.search_state_lock:
+            self.active_search_state = None
+            self.resume_processed_files = set()
+            self.resume_start_count = 0
+
+        self.refresh_search_session_ui()
+        messagebox.showinfo("Готово", "Состояние поиска успешно сброшено.")
+
+    def prepare_search_state(self, signature, total_files, resume_state=None):
+        """Инициализирует состояние поиска (новое или продолжение)."""
+        now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+        if resume_state:
+            processed_files = list(dict.fromkeys(resume_state.get("processed_files", [])))
+            resolved_total = max(int(total_files), int(resume_state.get("total_files", total_files)))
+            self.active_search_state = {
+                **resume_state,
+                "version": SEARCH_STATE_VERSION,
+                "signature": signature,
+                "status": "running",
+                "updated_at": now_str,
+                "last_error": "",
+                "processed_files": processed_files,
+                "processed_count": len(processed_files),
+                "matched_count": int(resume_state.get("matched_count", 0)),
+                "skipped_count": int(resume_state.get("skipped_count", 0)),
+                "error_count": int(resume_state.get("error_count", 0)),
+                "skip_reasons": dict(resume_state.get("skip_reasons", {})) if isinstance(resume_state.get("skip_reasons", {}), dict) else {},
+                "remaining_count": max(0, resolved_total - len(processed_files)),
+                "total_files": resolved_total,
+            }
+        else:
+            self.active_search_state = {
+                "version": SEARCH_STATE_VERSION,
+                "status": "running",
+                "created_at": now_str,
+                "updated_at": now_str,
+                "signature": signature,
+                "total_files": int(total_files),
+                "processed_count": 0,
+                "matched_count": 0,
+                "skipped_count": 0,
+                "error_count": 0,
+                "skip_reasons": dict(self.dashboard_skip_reasons),
+                "remaining_count": int(total_files),
+                "last_processed_file": "",
+                "last_error": "",
+                "processed_files": [],
+            }
+        self.save_search_state()
+        self.safe_after(0, self.refresh_search_session_ui)
+
+    def update_search_state_checkpoint(self, file_path, had_matches, error_text="", file_status="no_match", skip_reason=""):
+        """Обновляет состояние после обработки файла."""
+        with self.search_state_lock:
+            if not self.active_search_state:
+                return
+
+            processed_files = self.active_search_state.setdefault("processed_files", [])
+            if file_path not in self.resume_processed_files:
+                self.resume_processed_files.add(file_path)
+                processed_files.append(file_path)
+
+            self.active_search_state["processed_count"] = len(self.resume_processed_files)
+            if had_matches:
+                self.active_search_state["matched_count"] = int(self.active_search_state.get("matched_count", 0)) + 1
+            if file_status == "skipped":
+                self.active_search_state["skipped_count"] = int(self.active_search_state.get("skipped_count", 0)) + 1
+                normalized_reason = skip_reason if skip_reason in self.dashboard_skip_reasons else "other"
+                self.dashboard_skip_reasons[normalized_reason] = int(self.dashboard_skip_reasons.get(normalized_reason, 0)) + 1
+            if error_text:
+                self.active_search_state["error_count"] = int(self.active_search_state.get("error_count", 0)) + 1
+                self.active_search_state["last_error"] = error_text
+            self.active_search_state["last_processed_file"] = file_path
+            total_files = int(self.active_search_state.get("total_files", self.total_files))
+            self.active_search_state["remaining_count"] = max(0, total_files - len(self.resume_processed_files))
+            self.active_search_state["updated_at"] = time.strftime('%Y-%m-%d %H:%M:%S')
+            self.active_search_state["skip_reasons"] = dict(self.dashboard_skip_reasons)
+            matched_count = int(self.active_search_state.get("matched_count", 0))
+            skipped_count = int(self.active_search_state.get("skipped_count", 0))
+            error_count = int(self.active_search_state.get("error_count", 0))
+
+        self.dashboard_found = matched_count
+        self.dashboard_skipped = skipped_count
+        self.dashboard_errors = error_count
+        self.save_search_state()
+        self.safe_after(0, self.refresh_search_session_ui)
+        self.safe_after(0, self.update_dashboard_labels)
+
+    def finalize_search_state(self, status, error_text=""):
+        """Фиксирует финальный статус сессии поиска."""
+        with self.search_state_lock:
+            if not self.active_search_state:
+                return
+            self.active_search_state["status"] = status
+            self.active_search_state["updated_at"] = time.strftime('%Y-%m-%d %H:%M:%S')
+            self.active_search_state["processed_count"] = len(self.resume_processed_files)
+            total_files = int(self.active_search_state.get("total_files", self.total_files))
+            self.active_search_state["remaining_count"] = max(0, total_files - len(self.resume_processed_files))
+            if error_text:
+                self.active_search_state["last_error"] = error_text
+        self.save_search_state()
+        self.safe_after(0, self.refresh_search_session_ui)
+
+    def mark_search_crashed(self, error_title, exc_value):
+        """Помечает текущую сессию как аварийно завершенную."""
+        crash_reason = f"{error_title}: {exc_value}"
+        self.finalize_search_state("crashed", crash_reason)
+
+    def ensure_search_file_logging(self, log_file='search_log.txt'):
+        """Гарантирует ровно один файловый обработчик логов для поиска."""
+        logger = logging.getLogger()
+        if self.search_file_handler is not None:
+            try:
+                logger.removeHandler(self.search_file_handler)
+                self.search_file_handler.close()
+            except Exception:
+                pass
+            self.search_file_handler = None
+
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+        self.search_file_handler = file_handler
 
     def safe_after(self, delay_ms, callback, *args, allow_when_closing=False, **kwargs):
         """Безопасно планирует вызов в UI-потоке и не дает падать из-за after/callback."""
@@ -771,13 +1172,70 @@ class SearchApp:
             messagebox.showerror("Ошибка", "Не выбрано ни одной директории для поиска!")
             return
 
-        # Сбрасываем счетчики
-        self.processed_files = 0
-        self.total_files = 0
+        max_size_raw = str(self.max_size_var.get()).strip()
+        if max_size_raw == "":
+            max_file_size = 0
+        else:
+            try:
+                max_file_size = int(max_size_raw)
+            except ValueError:
+                messagebox.showerror("Ошибка", "Некорректный лимит размера файла (МБ).")
+                return
+        if max_file_size < 0:
+            messagebox.showerror("Ошибка", "Макс. размер файла не может быть отрицательным.")
+            return
 
         # Подсчитываем общее количество файлов для прогресса
+        calculated_total = 0
         for directory in self.directories_list:
-            self.total_files += self.count_files_to_process(directory, extensions)
+            calculated_total += self.count_files_to_process(directory, extensions)
+
+        signature = self.build_search_signature(extensions, keywords, max_file_size)
+        resume_state = None
+        self.resume_processed_files = set()
+        self.resume_start_count = 0
+        self.total_files = calculated_total
+        resume_matched_count = 0
+        resume_skipped_count = 0
+        resume_error_count = 0
+        resume_skip_reasons = {}
+
+        previous_state = self.load_search_state()
+        if (
+            previous_state
+            and previous_state.get("status") in ("running", "stopped", "crashed")
+            and previous_state.get("signature") == signature
+        ):
+            previous_processed = list(dict.fromkeys(previous_state.get("processed_files", [])))
+            previous_total = max(int(previous_state.get("total_files", 0)), calculated_total)
+            remaining = max(0, previous_total - len(previous_processed))
+            resume_choice = messagebox.askyesnocancel(
+                "Найден незавершенный поиск",
+                (
+                    "Найдена предыдущая незавершенная сессия поиска.\n\n"
+                    f"Уже обработано: {len(previous_processed)}\n"
+                    f"Осталось: {remaining}\n"
+                    f"Статус прошлой сессии: {previous_state.get('status', 'unknown')}\n\n"
+                    "Продолжить с прошлого места?"
+                ),
+                parent=self.root
+            )
+            if resume_choice is None:
+                return
+            if resume_choice:
+                resume_state = previous_state
+                self.resume_processed_files = set(previous_processed)
+                self.resume_start_count = len(self.resume_processed_files)
+                self.total_files = previous_total
+                resume_matched_count = int(previous_state.get("matched_count", 0))
+                resume_skipped_count = int(previous_state.get("skipped_count", 0))
+                resume_error_count = int(previous_state.get("error_count", 0))
+                if isinstance(previous_state.get("skip_reasons"), dict):
+                    resume_skip_reasons = dict(previous_state.get("skip_reasons"))
+                logging.info(
+                    f"Возобновление прошлой сессии: обработано {self.resume_start_count}, "
+                    f"осталось {max(0, self.total_files - self.resume_start_count)}"
+                )
 
         if self.total_files == 0:
             messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
@@ -790,6 +1248,17 @@ class SearchApp:
         self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
         start_message = f"Поиск начат: {self.search_start_time}"
         logging.info(start_message)
+        self.reset_dashboard(
+            self.total_files,
+            self.resume_start_count,
+            resume_matched_count,
+            resume_skipped_count,
+            resume_error_count,
+        )
+        if resume_skip_reasons:
+            for reason_key in self.dashboard_skip_reasons:
+                self.dashboard_skip_reasons[reason_key] = int(resume_skip_reasons.get(reason_key, 0))
+        self.prepare_search_state(signature, self.total_files, resume_state=resume_state)
 
         # Обновляем конфиг
         self.update_config()
@@ -802,12 +1271,9 @@ class SearchApp:
         self.config['config']['has_rar'] = HAS_RAR
         self.config['config']['has_ocr'] = HAS_OCR
 
-        # Настраиваем логирование без удаления файла
+        # Настраиваем логирование с защитой от дублирующихся обработчиков
         try:
-            # Просто добавляем обработчик, не удаляем старый файл
-            file_handler = logging.FileHandler('search_log.txt', mode='a', encoding='utf-8')
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            logging.getLogger().addHandler(file_handler)
+            self.ensure_search_file_logging('search_log.txt')
         except Exception as e:
             logging.error(f"Не удалось настроить файловое логирование: {e}")
 
@@ -815,6 +1281,7 @@ class SearchApp:
         try:
             load_keywords("keywords.txt")
         except ValueError as e:
+            self.finalize_search_state("stopped", str(e))
             messagebox.showerror("Ошибка", str(e))
             return
 
@@ -824,7 +1291,7 @@ class SearchApp:
         self.stop_button.config(state=tk.NORMAL)
         self.is_searching = True
         self.is_paused = False
-        self.processed_files = 0
+        self.processed_files = self.resume_start_count
 
         # Запускаем поиск в отдельном потоке
         self.search_thread = threading.Thread(
@@ -865,9 +1332,11 @@ class SearchApp:
 
     def run_search(self, extensions, progress_callback):
         """Выполнение поиска"""
+        search_completed = False
+        critical_error = ""
         try:
-            # Сбрасываем только processed_files при начале нового поиска
-            self.processed_files = 0
+            # При возобновлении продолжаем с уже обработанного количества.
+            self.processed_files = self.resume_start_count
             threads_count = self.normalize_threads_value()
             logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
 
@@ -895,7 +1364,9 @@ class SearchApp:
                         self.processed_files,  # Передаем текущее значение как offset
                         lambda: self.is_searching,
                         self.add_live_result,
-                        lambda: self.is_paused
+                        lambda: self.is_paused,
+                        self.resume_processed_files,
+                        self.update_search_state_checkpoint
                     )
 
                     # Показываем результаты для текущей директории
@@ -922,11 +1393,14 @@ class SearchApp:
             if self.is_searching:
                 logging.info("Поиск завершен!")
                 self.safe_after(0, self.update_progress, "Поиск завершен")
+                search_completed = True
 
         except Exception as e:
+            critical_error = str(e)
             self.report_runtime_error("Критическая ошибка во время поиска", e, show_dialog=True)
 
         finally:
+            was_searching = self.is_searching
             # Записываем время окончания поиска
             self.search_end_time = time.strftime('%Y-%m-%d %H:%M:%S')
             if self.is_searching:
@@ -951,6 +1425,13 @@ class SearchApp:
                 except ValueError:
                     pass
 
+            if search_completed:
+                self.finalize_search_state("completed")
+            elif was_searching and not self.is_closing:
+                self.finalize_search_state("crashed", critical_error)
+            else:
+                self.finalize_search_state("stopped")
+
             self.is_searching = False
             self.is_paused = False
             self.safe_after(0, self.on_search_finished)
@@ -964,6 +1445,7 @@ class SearchApp:
         """Обновление прогресса в основном потоке"""
         if isinstance(processed_count, int):
             self.processed_files = processed_count
+            self.update_dashboard_labels()
         self.update_progress(file_name)
 
     def on_search_finished(self):
@@ -971,6 +1453,7 @@ class SearchApp:
         self.start_button.config(state=tk.NORMAL)
         self.pause_button.config(state=tk.DISABLED, text="Пауза")
         self.stop_button.config(state=tk.DISABLED)
+        self.update_dashboard_labels()
         # Если остановка была пользователем, финализируем человекочитаемый статус
         if self.current_file.get() == "Останавливаем поиск...":
             self.current_file.set("Поиск остановлен пользователем")
@@ -982,6 +1465,8 @@ class SearchApp:
 
         current_cfg = self.config['config']
         threads_count = self.normalize_threads_value()
+        max_size_to_save = str(self.max_size_var.get()).strip() or "0"
+        max_path_to_save = str(self.max_path_length_var.get()).strip() or "0"
 
         # Обновляем конфиг
         config['Settings'] = {
@@ -993,7 +1478,8 @@ class SearchApp:
             'threads': str(threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
-            'max_file_size': self.max_size_var.get(),
+            'max_file_size': max_size_to_save,
+            'max_path_length': max_path_to_save,
             'log_file': current_cfg.get('log_file', 'search_log.txt'),
             'tesseract_languages': current_cfg.get('tesseract_languages', 'rus'),
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
@@ -1010,6 +1496,15 @@ class SearchApp:
         if reload_after_save:
             new_config = load_config()
             self.config['config'] = new_config
+
+    def save_keywords_to_file(self):
+        """Сохраняет текущий текст ключевых слов в keywords.txt."""
+        try:
+            keywords = self.keywords_text.get("1.0", tk.END).strip()
+            with open("keywords.txt", "w", encoding="utf-8") as f:
+                f.write(keywords)
+        except Exception as exc:
+            logging.error(f"Не удалось сохранить keywords.txt при закрытии: {exc}")
 
     def on_close(self):
         """Корректное завершение приложения с остановкой фоновых потоков."""
@@ -1042,9 +1537,16 @@ class SearchApp:
             pass
 
         try:
-            if self.config_dirty:
-                self.update_config(reload_after_save=False)
+            self.save_keywords_to_file()
+            self.update_config(reload_after_save=False)
         finally:
+            if self.search_file_handler is not None:
+                try:
+                    logging.getLogger().removeHandler(self.search_file_handler)
+                    self.search_file_handler.close()
+                except Exception:
+                    pass
+                self.search_file_handler = None
             self.root.destroy()
 
     def start_invalid_password_timer(self):
@@ -1112,6 +1614,7 @@ def main():
 
         log_path = write_crash_report(error_title, exc_value, exc_traceback)
         logging.error("%s: %s", error_title, exc_value)
+        app.mark_search_crashed(error_title, exc_value)
         try:
             app.safe_after(
                 0,

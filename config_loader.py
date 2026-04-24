@@ -1,13 +1,35 @@
 import os
 import configparser
 
+IMAGE_EXTENSION_PATTERNS = (
+    '*.jpg', '*.jpeg', '*.jpe', '*.jfif',
+    '*.png', '*.bmp', '*.gif', '*.tif', '*.tiff', '*.webp', '*.ico'
+)
+WORD_EXTENSION_PATTERNS = ('*.doc', '*.docx', '*.docm', '*.dot', '*.dotx', '*.dotm')
+EXCEL_EXTENSION_PATTERNS = ('*.xls', '*.xlsx', '*.xlsm', '*.xlt', '*.xltx', '*.xltm')
+
+
+def _safe_getint(config, section, option, fallback):
+    """Безопасно читает int из конфига, поддерживая пустые значения."""
+    raw_value = config.get(section, option, fallback=str(fallback))
+    if raw_value is None:
+        return fallback
+    value_str = str(raw_value).strip()
+    if value_str == "":
+        return fallback
+    try:
+        return int(value_str)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def load_config(config_file="config.txt"):
     """Загрузка конфигурации из файла"""
     config = configparser.ConfigParser()
 
     # Значения по умолчанию
     defaults = {
-        'extensions': ['*.txt', '*.pdf', '*.docx', '*.xlsx', '*.jpg', '*.png', '*.zip', '*.rar', '*.7z'],
+        'extensions': ['*.txt', '*.pdf', *WORD_EXTENSION_PATTERNS, *EXCEL_EXTENSION_PATTERNS, *IMAGE_EXTENSION_PATTERNS, '*.zip', '*.rar', '*.7z'],
         'keywords_file': 'keywords.txt',
         'directories': '.',
         'directory': '.',
@@ -23,6 +45,7 @@ def load_config(config_file="config.txt"):
         'max_image_size_mb': '10',
         'max_pdf_pages': '0',  # 0 = без ограничения
         'max_excel_rows_per_sheet': '0',  # 0 = без ограничения
+        'max_path_length': '240',
     }
 
     # Если файл конфигурации существует, загружаем его
@@ -33,25 +56,29 @@ def load_config(config_file="config.txt"):
             print(f"Ошибка чтения конфигурационного файла: {e}")
             return defaults
 
+    # Пустой или некорректный конфиг может не содержать секцию Settings.
+    # Добавляем ее, чтобы безопасно использовать fallback для всех параметров.
+    if not config.has_section('Settings'):
+        config.add_section('Settings')
+
     # Получаем значения из конфига или используем значения по умолчанию
     extensions = config.get('Settings', 'extensions', fallback=','.join(defaults['extensions'])).split(',')
     keywords_file = config.get('Settings', 'keywords_file', fallback=defaults['keywords_file'])
     directory = config.get('Settings', 'directory', fallback=defaults['directory'])
     directories_raw = config.get('Settings', 'directories', fallback=defaults['directories'])
     theme = config.get('Settings', 'theme', fallback=defaults['theme'])
-    threads = config.getint('Settings', 'threads', fallback=int(defaults['threads']))
+    threads = _safe_getint(config, 'Settings', 'threads', int(defaults['threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
-    max_file_size = config.getint('Settings', 'max_file_size', fallback=int(defaults['max_file_size']))
+    max_file_size = _safe_getint(config, 'Settings', 'max_file_size', int(defaults['max_file_size']))
     log_file = config.get('Settings', 'log_file', fallback=defaults['log_file'])
     tesseract_languages = config.get('Settings', 'tesseract_languages', fallback=defaults['tesseract_languages'])
     tesseract_config = config.get('Settings', 'tesseract_config', fallback=defaults['tesseract_config'])
-    max_image_size_mb = config.getint('Settings', 'max_image_size_mb', fallback=int(defaults['max_image_size_mb']))
-    max_pdf_pages = config.getint('Settings', 'max_pdf_pages', fallback=int(defaults['max_pdf_pages']))
-    max_excel_rows_per_sheet = config.getint(
-        'Settings',
-        'max_excel_rows_per_sheet',
-        fallback=int(defaults['max_excel_rows_per_sheet']),
+    max_image_size_mb = _safe_getint(config, 'Settings', 'max_image_size_mb', int(defaults['max_image_size_mb']))
+    max_pdf_pages = _safe_getint(config, 'Settings', 'max_pdf_pages', int(defaults['max_pdf_pages']))
+    max_path_length = _safe_getint(config, 'Settings', 'max_path_length', int(defaults['max_path_length']))
+    max_excel_rows_per_sheet = _safe_getint(
+        config, 'Settings', 'max_excel_rows_per_sheet', int(defaults['max_excel_rows_per_sheet'])
     )
 
     # Очищаем значения от пробелов
@@ -69,7 +96,7 @@ def load_config(config_file="config.txt"):
     # Если поиск по изображениям отключен, убираем изображения из расширений
     if not search_images:
         extensions = [ext for ext in extensions if
-                      not ext.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff'))]
+                      ext.lower() not in IMAGE_EXTENSION_PATTERNS]
 
     return {
         'extensions': extensions,
@@ -86,6 +113,7 @@ def load_config(config_file="config.txt"):
         'tesseract_config': tesseract_config,
         'max_image_size_mb': max_image_size_mb,
         'max_pdf_pages': max_pdf_pages,
+        'max_path_length': max_path_length,
         'max_excel_rows_per_sheet': max_excel_rows_per_sheet,
     }
 
@@ -93,7 +121,7 @@ def create_default_config():
     """Создание файла конфигурации по умолчанию"""
     config_content = """[Settings]
 # Расширения файлов для поиска (через запятую)
-extensions = *.txt, *.pdf, *.docx, *.xlsx, *.jpg, *.png, *.zip, *.rar, *.7z
+extensions = *.txt, *.pdf, *.doc, *.docx, *.docm, *.dot, *.dotx, *.dotm, *.xls, *.xlsx, *.xlsm, *.xlt, *.xltx, *.xltm, *.jpg, *.jpeg, *.jpe, *.jfif, *.png, *.bmp, *.gif, *.tif, *.tiff, *.webp, *.ico, *.zip, *.rar, *.7z
 
 # Файл с ключевыми словами (каждое слово с новой строки)
 keywords_file = keywords.txt
@@ -131,6 +159,9 @@ max_image_size_mb = 10
 
 # Максимальное количество страниц PDF для анализа (0 = без ограничения)
 max_pdf_pages = 0
+
+# Максимальная длина пути к файлу (символов)
+max_path_length = 240
 
 # Максимальное количество строк Excel на лист (0 = без ограничения)
 max_excel_rows_per_sheet = 0

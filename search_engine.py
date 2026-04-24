@@ -6,7 +6,7 @@ from typing import List, Dict, Set
 
 import logging
 
-from file_processing import process_file  # Импортируем функцию обработки файла
+from file_processing import process_file_with_meta  # Импортируем функцию обработки файла
 
 SEARCH_RESULTS_ENCODING = 'utf-8-sig'
 
@@ -42,18 +42,22 @@ def _process_file_with_start(file_path: str, extensions: List[str], max_file_siz
     if is_searching_func and not is_searching_func():
         return {}
 
-    return process_file(file_path, extensions, max_file_size, config)
+    return process_file_with_meta(file_path, extensions, max_file_size, config)
 
 
 def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, output_file: str = None,
                  max_file_size: int = 10, config: dict = None, progress_callback: callable = None,
                  start_count: int = 0, is_searching_func: callable = None,
-                 result_callback: callable = None, is_paused_func: callable = None) -> Dict[str, Set[str]]:
+                 result_callback: callable = None, is_paused_func: callable = None,
+                 processed_files_set: set = None, file_completed_callback: callable = None) -> Dict[str, Set[str]]:
     """Многопоточный поиск файлов с поддержкой offset и проверкой флага остановки"""
     results: Dict[str, Set[str]] = {}
 
     # Собираем все файлы для обработки
     files_to_process: List[str] = []
+    already_processed_set = processed_files_set or set()
+    skipped_processed = 0
+
     for root, _, files in os.walk(root_dir):
         if not _wait_if_paused(is_paused_func, is_searching_func):
             break
@@ -66,9 +70,16 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
         for file in files:
             file_path = os.path.join(root, file)
             if any(fnmatch.fnmatch(file, ext_pattern) for ext_pattern in extensions):
+                if file_path in already_processed_set:
+                    skipped_processed += 1
+                    continue
                 files_to_process.append(file_path)
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")
+    if skipped_processed:
+        logging.info(
+            f"Пропущено уже обработанных файлов в {root_dir}: {skipped_processed}"
+        )
 
     # Открываем файл для записи результатов
     output_handle = None
@@ -78,7 +89,7 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
             if start_count == 0 and file_is_empty:
                 output_handle = open(output_file, 'w', encoding=SEARCH_RESULTS_ENCODING)
             else:
-                output_handle = open(output_file, 'a', encoding='utf-8')
+                output_handle = open(output_file, 'a', encoding=SEARCH_RESULTS_ENCODING)
 
             # Пишем заголовок только если файл пустой и это самое начало
             if start_count == 0 and file_is_empty:
@@ -134,9 +145,21 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 except Exception as e:
                     logging.error(f"Ошибка в callback обновления прогресса: {e}")
 
+            file_had_matches = False
+            file_error = ""
+            file_status = "no_match"
+            skip_reason = ""
             try:
-                result = future.result(timeout=300)
+                payload = future.result(timeout=300)
+                if isinstance(payload, tuple) and len(payload) >= 4:
+                    result, file_status, file_error, skip_reason = payload[0], payload[1], payload[2] or "", payload[3] or ""
+                elif isinstance(payload, tuple) and len(payload) >= 3:
+                    result, file_status, file_error = payload[0], payload[1], payload[2] or ""
+                else:
+                    result = payload or {}
+                    file_status = "matched" if result else "no_match"
                 if result:
+                    file_had_matches = True
                     results.update(result)
                     if result_callback and callable(result_callback):
                         try:
@@ -150,9 +173,19 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                             output_handle.write(f"Найденные ключевые слова: {', '.join(keywords_found)}\n\n")
                             output_handle.flush()
             except FuturesTimeoutError:
-                logging.error(f"Таймаут при обработке файла {file_path}")
+                file_status = "error"
+                file_error = f"Таймаут при обработке файла {file_path}"
+                logging.error(file_error)
             except Exception as e:
-                logging.error(f"Ошибка при обработке файла {file_path}: {e}")
+                file_status = "error"
+                file_error = f"Ошибка при обработке файла {file_path}: {e}"
+                logging.error(file_error)
+            finally:
+                if file_completed_callback and callable(file_completed_callback):
+                    try:
+                        file_completed_callback(file_path, file_had_matches, file_error, file_status, skip_reason)
+                    except Exception as callback_error:
+                        logging.error(f"Ошибка в callback завершения файла: {callback_error}")
     finally:
         # При остановке не блокируемся, ожидая завершения всех worker'ов.
         if stop_requested:

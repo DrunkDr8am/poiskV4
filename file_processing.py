@@ -15,6 +15,50 @@ KEYWORDS_WORDS: Set[str] = set()
 # Ключевые слова, которые ищем как подстроки (короткие/со спецсимволами)
 KEYWORDS_SUBSTR: Set[str] = set()
 
+MAX_SAFE_WINDOWS_PATH_LENGTH = 240
+MAX_SAFE_WINDOWS_NAME_LENGTH = 180
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.jpe', '.jfif', '.bmp', '.gif', '.tif', '.tiff', '.webp', '.ico')
+WORD_EXTENSIONS = ('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')
+EXCEL_EXTENSIONS = ('.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm')
+
+
+def get_long_path_reason(file_path: str, config: dict = None) -> str:
+    """Возвращает причину пропуска файла при слишком длинном пути на Windows."""
+    if os.name != 'nt':
+        return ""
+
+    max_path_length = MAX_SAFE_WINDOWS_PATH_LENGTH
+    if isinstance(config, dict):
+        try:
+            max_path_length = int(config.get('max_path_length', MAX_SAFE_WINDOWS_PATH_LENGTH))
+        except (TypeError, ValueError):
+            max_path_length = MAX_SAFE_WINDOWS_PATH_LENGTH
+
+    # 0 или отрицательное значение означает "без ограничения по длине пути".
+    if max_path_length <= 0:
+        return ""
+
+    normalized_path = os.path.normpath(file_path)
+    if len(normalized_path) > max_path_length:
+        return (
+            f"слишком длинный путь ({len(normalized_path)} символов, "
+            f"лимит {max_path_length})"
+        )
+
+    file_name = os.path.basename(normalized_path)
+    if len(file_name) > MAX_SAFE_WINDOWS_NAME_LENGTH:
+        return (
+            f"слишком длинное имя файла ({len(file_name)} символов, "
+            f"лимит {MAX_SAFE_WINDOWS_NAME_LENGTH})"
+        )
+
+    return ""
+
+
+def log_long_path_skip(file_path: str, reason: str) -> None:
+    """Логирует пропуск файла из-за слишком длинного пути/имени."""
+    logging.warning(f"Пропуск файла {file_path}: {reason}")
+
 
 def load_keywords(keywords_file: str) -> List[str]:
     """Загрузка ключевых слов из файла с проверкой кодировки
@@ -223,7 +267,7 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 docx2txt.process(docx_path, temp_dir)
                 for img_file in os.listdir(temp_dir):
-                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')):
+                    if img_file.lower().endswith(IMAGE_EXTENSIONS):
                         img_path = os.path.join(temp_dir, img_file)
                         found.update(search_in_image(img_path, config))
     except Exception as e:
@@ -236,7 +280,7 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
 
 
 def search_in_excel(excel_path: str, config: dict) -> Set[str]:
-    """Обработка Excel файлов с поддержкой старых форматов .xls."""
+    """Обработка Excel файлов с поддержкой старых и новых форматов."""
     found = set()
     try:
         # Пропускаем временные файлы Excel
@@ -246,7 +290,7 @@ def search_in_excel(excel_path: str, config: dict) -> Set[str]:
         # Определяем расширение файла
         file_ext = os.path.splitext(excel_path)[1].lower()
 
-        if file_ext == '.xlsx':
+        if file_ext in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
             # Для новых форматов используем openpyxl
             try:
                 import openpyxl
@@ -258,9 +302,9 @@ def search_in_excel(excel_path: str, config: dict) -> Set[str]:
                             if cell and isinstance(cell, str):
                                 found.update(search_in_text(cell))
             except ImportError:
-                logging.warning("Модуль openpyxl не установлен. Пропуск файла .xlsx")
+                logging.warning(f"Модуль openpyxl не установлен. Пропуск файла {file_ext}")
 
-        elif file_ext == '.xls':
+        elif file_ext in ('.xls', '.xlt'):
             # Для старых форматов используем xlrd
             try:
                 import xlrd
@@ -273,9 +317,9 @@ def search_in_excel(excel_path: str, config: dict) -> Set[str]:
                             if cell_value and isinstance(cell_value, str):
                                 found.update(search_in_text(str(cell_value)))
             except ImportError:
-                logging.warning("Модуль xlrd не установлен. Пропуск файла .xls")
+                logging.warning(f"Модуль xlrd не установлен. Пропуск файла {file_ext}")
             except Exception as e:
-                logging.error(f"Ошибка обработки Excel .xls {excel_path}: {e}")
+                logging.error(f"Ошибка обработки Excel {file_ext} {excel_path}: {e}")
 
         else:
             logging.warning(f"Неизвестное расширение файла Excel: {excel_path}")
@@ -296,27 +340,34 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                         if any(fnmatch.fnmatch(file, ext) for ext in extensions):
                             # Для текстовых файлов читаем напрямую
                             if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
-                                with z.open(file) as f:
-                                    content = f.read().decode('utf-8', errors='ignore')
-                                    found.update(search_in_text(content))
+                                try:
+                                    with z.open(file) as f:
+                                        content = f.read().decode('utf-8', errors='ignore')
+                                        found.update(search_in_text(content))
+                                except Exception as e:
+                                    logging.warning(f"Не удалось открыть файл {file} внутри ZIP {archive_path}: {e}")
+                                    continue
                             else:
                                 # Извлекаем файл во временную директорию один раз
-                                z.extract(file, temp_dir)
+                                try:
+                                    z.extract(file, temp_dir)
+                                except Exception as e:
+                                    logging.warning(f"Не удалось извлечь файл {file} из ZIP {archive_path}: {e}")
+                                    continue
                                 extracted_file = os.path.join(temp_dir, file)
                                 if os.path.isfile(extracted_file):
                                     # Обрабатываем изображения (только если OCR доступен)
-                                    if file.lower().endswith(
-                                            ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')) and config.get(
+                                    if file.lower().endswith(IMAGE_EXTENSIONS) and config.get(
                                         'has_ocr', False):
                                         found.update(search_in_image(extracted_file, config))
                                     # Обрабатываем PDF
                                     elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
                                         found.update(search_in_pdf(extracted_file, config))
                                     # Обрабатываем DOCX
-                                    elif file.lower().endswith(('.docx', '.doc')) and config.get('has_docx', False):
+                                    elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
                                         found.update(search_in_docx(extracted_file, config))
                                     # Обрабатываем Excel
-                                elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                    elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
                                         found.update(search_in_excel(extracted_file, config))
 
 
@@ -349,15 +400,14 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                                 found.update(search_in_text(content))
                                         except:
                                             pass
-                                elif file.lower().endswith(
-                                        ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')) and config.get('has_ocr',
+                                elif file.lower().endswith(IMAGE_EXTENSIONS) and config.get('has_ocr',
                                                                                                           False):
                                     found.update(search_in_image(file_path, config))
                                 elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
                                     found.update(search_in_pdf(file_path, config))
-                                elif file.lower().endswith(('.docx', '.doc')) and config.get('has_docx', False):
+                                elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
                                     found.update(search_in_docx(file_path, config))
-                                elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
                                     found.update(search_in_excel(file_path, config))
                 except Exception as e:
                     logging.error(f"Ошибка обработки 7z архива {archive_path}: {e}")
@@ -374,27 +424,34 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                         if any(fnmatch.fnmatch(file, ext) for ext in extensions):
                             # Для текстовых файлов читаем напрямую
                             if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
-                                with z.open(file) as f:
-                                    content = f.read().decode('utf-8', errors='ignore')
-                                    found.update(search_in_text(content))
+                                try:
+                                    with z.open(file) as f:
+                                        content = f.read().decode('utf-8', errors='ignore')
+                                        found.update(search_in_text(content))
+                                except Exception as e:
+                                    logging.warning(f"Не удалось открыть файл {file} внутри RAR {archive_path}: {e}")
+                                    continue
                             else:
                                 # Извлекаем файл во временную директорию один раз
-                                z.extract(file, temp_dir)
+                                try:
+                                    z.extract(file, temp_dir)
+                                except Exception as e:
+                                    logging.warning(f"Не удалось извлечь файл {file} из RAR {archive_path}: {e}")
+                                    continue
                                 extracted_file = os.path.join(temp_dir, file)
                                 if os.path.isfile(extracted_file):
                                     # Обрабатываем изображения (только если OCR доступен)
-                                    if file.lower().endswith(
-                                            ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')) and config.get(
+                                    if file.lower().endswith(IMAGE_EXTENSIONS) and config.get(
                                         'has_ocr', False):
                                         found.update(search_in_image(extracted_file, config))
                                     # Обрабатываем PDF
                                     elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
                                         found.update(search_in_pdf(extracted_file, config))
                                     # Обрабатываем DOCX
-                                    elif file.lower().endswith(('.docx', '.doc')) and config.get('has_docx', False):
+                                    elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
                                         found.update(search_in_docx(extracted_file, config))
                                     # Обрабатываем Excel
-                                    elif file.lower().endswith(('.xls', '.xlsx')) and config.get('has_excel', False):
+                                    elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
                                         found.update(search_in_excel(extracted_file, config))
 
     except Exception as e:
@@ -402,70 +459,99 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
     return found
 
 
-def process_file(file_path: str, extensions: List[str], max_file_size: int, config: dict) -> Dict[str, Set[str]]:
-    """Обработка отдельного файла"""
+def process_file_with_meta(file_path: str, extensions: List[str], max_file_size: int, config: dict):
+    """Обработка отдельного файла с мета-статусом.
+
+    Возвращает кортеж: (result_dict, status, error_text, skip_reason),
+    где status: matched | no_match | skipped | error.
+    """
     found = set()
+    status = "no_match"
+    skip_reason = ""
     try:
-        # Проверяем размер файла
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if file_size_mb > max_file_size:
-            logging.warning(
-                f"Пропуск файла {file_path} (размер {file_size_mb:.2f} МБ превышает лимит {max_file_size} МБ)")
-            return {}
+        long_path_reason = get_long_path_reason(file_path, config)
+        if long_path_reason:
+            log_long_path_skip(file_path, long_path_reason)
+            return {}, "skipped", "", "long_path"
+
+        # Проверяем размер файла только если лимит включен (> 0).
+        if max_file_size and max_file_size > 0:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if file_size_mb > max_file_size:
+                logging.warning(
+                    f"Пропуск файла {file_path} (размер {file_size_mb:.2f} МБ превышает лимит {max_file_size} МБ)")
+                return {}, "skipped", "", "large_file"
 
         ext = os.path.splitext(file_path)[1].lower()
 
         # Обработка в зависимости от типа файла
-        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'):
-            # Проверяем доступность OCR через конфиг
+        if ext in IMAGE_EXTENSIONS:
             if config.get('has_ocr', False):
                 found = search_in_image(file_path, config)
             else:
                 logging.info(f"Пропуск изображения {file_path} (OCR недоступен)")
+                return {}, "skipped", "", "module_unavailable"
         elif ext == '.pdf':
-            # Проверяем доступность обработки PDF
             if config.get('has_pdf', False):
                 found = search_in_pdf(file_path, config)
             else:
                 logging.info(f"Пропуск PDF {file_path} (обработка PDF недоступна)")
-        elif ext in ('.doc', '.docx'):
-            # Проверяем доступность обработки DOCX
+                return {}, "skipped", "", "module_unavailable"
+        elif ext in WORD_EXTENSIONS:
             if config.get('has_docx', False):
                 found = search_in_docx(file_path, config)
             else:
                 logging.info(f"Пропуск DOCX {file_path} (обработка DOCX недоступна)")
-        elif ext in ('.xls', '.xlsx'):
-            # Проверяем доступность обработки Excel
+                return {}, "skipped", "", "module_unavailable"
+        elif ext in EXCEL_EXTENSIONS:
             if config.get('has_excel', False):
                 found = search_in_excel(file_path, config)
             else:
                 logging.info(f"Пропуск Excel {file_path} (обработка Excel недоступна)")
+                return {}, "skipped", "", "module_unavailable"
         elif ext in ('.zip', '.7z', '.rar'):
-            # Для архивов проверяем доступность соответствующих модулей
             if ext == '.7z' and not config.get('has_7z', False):
                 logging.info(f"Пропуск 7Z {file_path} (обработка 7Z недоступна)")
-            elif ext == '.rar' and not config.get('has_rar', False):
+                return {}, "skipped", "", "module_unavailable"
+            if ext == '.rar' and not config.get('has_rar', False):
                 logging.info(f"Пропуск RAR {file_path} (обработка RAR недоступна)")
-            else:
-                found = search_in_archive(file_path, extensions, config)  # Передаем config
+                return {}, "skipped", "", "module_unavailable"
+            found = search_in_archive(file_path, extensions, config)
         else:
-            # Обработка текстовых файлов
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                     found = search_in_text(content)
             except UnicodeDecodeError:
                 encodings = ['cp1251', 'iso-8859-1', 'latin1']
+                decoded = False
                 for encoding in encodings:
                     try:
                         with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                             content = f.read()
                             found = search_in_text(content)
+                            decoded = True
                             break
                     except UnicodeDecodeError:
                         continue
+                if not decoded:
+                    logging.warning(f"Пропуск файла {file_path} (ошибка чтения текста)")
+                    return {}, "skipped", "", "read_error"
+            except OSError as read_error:
+                logging.warning(f"Пропуск файла {file_path} (ошибка чтения: {read_error})")
+                return {}, "skipped", "", "read_error"
 
-        return {file_path: found} if found else {}
+        if found:
+            status = "matched"
+            return {file_path: found}, status, "", ""
+        return {}, status, "", ""
     except Exception as e:
-        logging.error(f"Ошибка обработки файла {file_path}: {e}")
-        return {}
+        error_text = f"Ошибка обработки файла {file_path}: {e}"
+        logging.error(error_text)
+        return {}, "error", error_text, ""
+
+
+def process_file(file_path: str, extensions: List[str], max_file_size: int, config: dict) -> Dict[str, Set[str]]:
+    """Обратная совместимость: возвращает только словарь совпадений."""
+    result, _, _, _ = process_file_with_meta(file_path, extensions, max_file_size, config)
+    return result
