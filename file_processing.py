@@ -9,6 +9,8 @@ import re
 import json
 import subprocess
 import sys
+import html
+import xml.etree.ElementTree as ET
 
 # Глобальные переменные для хранения ключевых слов
 # KEYWORDS_LOWER содержит все ключевые слова в нижнем регистре
@@ -23,7 +25,201 @@ MAX_SAFE_WINDOWS_NAME_LENGTH = 180
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.jpe', '.jfif', '.bmp', '.gif', '.tif', '.tiff', '.webp', '.ico')
 WORD_EXTENSIONS = ('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')
 EXCEL_EXTENSIONS = ('.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm')
-PDF_SUBPROCESS_TIMEOUT_SEC = 120
+PDF_SUBPROCESS_TIMEOUT_SEC = 300
+PDF_OCR_TESSERACT_CONFIG = '--oem 3 --psm 3'
+PDF_OCR_RENDER_ZOOM = 1.5
+WORD_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+XML_TAG_PATTERN = re.compile(rb"<[^>]+>")
+XLSX_EMPTY_ROW_STREAK_LIMIT = 200
+
+
+# Параллелизм OCR не ограничиваем до 1: пользователю важна скорость.
+OCR_CONCURRENCY_LIMIT = max(1, os.cpu_count() or 2)
+
+
+def _extract_json_from_stdout(stdout_text: str) -> Dict:
+    """Пытается извлечь JSON-объект даже при «шуме» в stdout."""
+    raw = (stdout_text or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    start_idx = raw.find("{")
+    end_idx = raw.rfind("}")
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return {}
+
+    candidate = raw[start_idx:end_idx + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _normalize_pil_for_ocr(pil_img):
+    """Приводит PIL-изображение к режиму, подходящему для Tesseract."""
+    if pil_img.mode == 'P' and 'transparency' in pil_img.info:
+        pil_img = pil_img.convert('RGBA')
+    if pil_img.mode == 'RGBA':
+        pil_img = pil_img.convert('RGB')
+    elif pil_img.mode not in ('RGB', 'L'):
+        pil_img = pil_img.convert('RGB')
+    return pil_img
+
+
+def _prepare_image_for_ocr(pil_img):
+    """Предобработка изображения перед OCR (контраст, градации серого)."""
+    from PIL import ImageOps  # type: ignore
+
+    pil_img = _normalize_pil_for_ocr(pil_img)
+    gray = pil_img.convert('L')
+    return ImageOps.autocontrast(gray)
+
+
+def _pdf_ocr_languages(ocr_lang: str) -> str:
+    """Для PDF-сканов добавляет eng к rus, если ещё не указан."""
+    lang = (ocr_lang or "rus").strip() or "rus"
+    parts = [part.strip() for part in lang.split('+') if part.strip()]
+    if 'rus' in parts and 'eng' not in parts:
+        parts.append('eng')
+    return '+'.join(parts) if parts else 'rus+eng'
+
+
+def _ocr_pil_image(pil_img, pytesseract, ocr_lang: str, ocr_cfg: str, preprocess: bool = True) -> str:
+    """Распознаёт текст на PIL-изображении."""
+    if preprocess:
+        pil_img = _prepare_image_for_ocr(pil_img)
+    else:
+        pil_img = _normalize_pil_for_ocr(pil_img)
+    return pytesseract.image_to_string(
+        pil_img,
+        lang=_pdf_ocr_languages(ocr_lang),
+        config=ocr_cfg or PDF_OCR_TESSERACT_CONFIG,
+    )
+
+
+def _extract_embedded_pdf_image(doc, xref: int, Image):
+    """Извлекает встроенное изображение PDF с учётом smask (маски прозрачности)."""
+    base_image = doc.extract_image(xref)
+    if not base_image or "image" not in base_image:
+        return None
+
+    pil_img = Image.open(BytesIO(base_image["image"]))
+    smask_bytes = base_image.get("smask")
+    if not smask_bytes:
+        return pil_img
+
+    mask = Image.open(BytesIO(smask_bytes)).convert('L')
+    if mask.size != pil_img.size:
+        mask = mask.resize(pil_img.size)
+    pil_rgba = pil_img.convert('RGBA')
+    pil_rgba.putalpha(mask)
+    background = Image.new('RGB', pil_rgba.size, (255, 255, 255))
+    background.paste(pil_rgba, mask=pil_rgba.split()[-1])
+    return background
+
+
+def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, ocr_lang: str, ocr_cfg: str) -> str:
+    """OCR всей страницы PDF как растрового изображения."""
+    try:
+        zoom = PDF_OCR_RENDER_ZOOM
+        matrix = fitz_module.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        if pix.width <= 0 or pix.height <= 0:
+            return ""
+        pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        return _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg)
+    except Exception:
+        return ""
+
+
+def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, ocr_lang: str, ocr_cfg: str) -> str:
+    """OCR страницы-скана: растеризация страницы + встроенные изображения."""
+    ocr_chunks = []
+    page_text = _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, ocr_lang, ocr_cfg)
+    if page_text:
+        ocr_chunks.append(page_text)
+
+    for img in page.get_images(full=True):
+        try:
+            pil_img = _extract_embedded_pdf_image(doc, img[0], Image)
+            if pil_img is None:
+                continue
+            embedded_text = _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg)
+            if embedded_text:
+                ocr_chunks.append(embedded_text)
+        except Exception:
+            continue
+
+    return "\n".join(ocr_chunks)
+
+
+def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], keywords_substr: Set[str],
+                        keywords_all: Set[str]) -> Set[str]:
+    """Базовая логика поиска в PDF (используется worker-ом и fallback-режимом)."""
+    found = set()
+    import fitz  # type: ignore
+
+    with fitz.open(pdf_path) as doc:
+        max_pages = int(config.get('max_pdf_pages', 0) or 0)
+        has_ocr = bool(config.get('has_ocr', False))
+        ocr_lang = config.get('tesseract_languages', 'rus')
+        ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
+        ocr_ready = False
+        pytesseract = None
+        Image = None
+        if has_ocr:
+            try:
+                import pytesseract as _pytesseract  # type: ignore
+                from PIL import Image as _Image  # type: ignore
+                pytesseract = _pytesseract
+                Image = _Image
+                ocr_ready = True
+            except Exception:
+                ocr_ready = False
+
+        for page_index, page in enumerate(doc):
+            if max_pages > 0 and page_index >= max_pages:
+                break
+
+            text = page.get_text()
+            found.update(_search_in_text_worker(text, keywords_words, keywords_substr))
+            if keywords_all and found.issuperset(keywords_all):
+                break
+
+            if not ocr_ready:
+                continue
+
+            page_text_empty = not (text or "").strip()
+            if page_text_empty:
+                # Скан / «картиночный» PDF: OCR страницы и встроенных изображений (с маской smask).
+                ocr_text = _ocr_pdf_scanned_page(
+                    page, doc, fitz, pytesseract, Image, ocr_lang, PDF_OCR_TESSERACT_CONFIG
+                )
+                found.update(_search_in_ocr_text(ocr_text, keywords_words, keywords_substr))
+            else:
+                # PDF с текстовым слоем: дополнительно проверяем встроенные изображения.
+                for img in page.get_images(full=True):
+                    try:
+                        pil_img = _extract_embedded_pdf_image(doc, img[0], Image)
+                        if pil_img is None:
+                            continue
+                        ocr_text = _ocr_pil_image(
+                            pil_img, pytesseract, ocr_lang, ocr_cfg, preprocess=False
+                        )
+                        found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
+                        if keywords_all and found.issuperset(keywords_all):
+                            break
+                    except Exception:
+                        continue
+
+            if keywords_all and found.issuperset(keywords_all):
+                break
+
+    return found
 
 
 def _search_in_text_worker(text: str, words: Set[str], substr: Set[str]) -> Set[str]:
@@ -33,13 +229,34 @@ def _search_in_text_worker(text: str, words: Set[str], substr: Set[str]) -> Set[
     text_lower = text.lower()
     found = set()
     if words:
-        token_set = set(re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text_lower))
+        token_set = set(WORD_PATTERN.findall(text_lower))
         for kw in words:
             if kw in token_set:
                 found.add(kw)
     if substr:
         for kw in substr:
             if kw in text_lower:
+                found.add(kw)
+    return found
+
+
+def _search_in_ocr_text(text: str, words: Set[str], substr: Set[str]) -> Set[str]:
+    """Поиск в OCR-тексте: целые слова + подстроки (для склонений и ошибок распознавания)."""
+    found = _search_in_text_worker(text, words, substr)
+    if not text:
+        return found
+    text_lower = text.lower()
+    for kw in words:
+        if kw not in found and kw in text_lower:
+            found.add(kw)
+    # Для "рваного" OCR (разрывы внутри слов) проверяем склеенную версию текста.
+    compact_text = "".join(WORD_PATTERN.findall(text_lower))
+    if compact_text:
+        for kw in words:
+            if kw not in found and kw in compact_text:
+                found.add(kw)
+        for kw in substr:
+            if kw not in found and kw in compact_text:
                 found.add(kw)
     return found
 
@@ -60,7 +277,13 @@ def run_pdf_worker_cli(argv: List[str]) -> int:
         print(json.dumps({"ok": False, "error": f"bad_json: {e}"}), end="")
         return 2
 
-    found = set()
+    if config.get("has_ocr", False):
+        try:
+            from tesseract_setup import setup_tesseract
+            setup_tesseract()
+        except Exception:
+            pass
+
     try:
         import fitz  # type: ignore
     except Exception as e:
@@ -68,56 +291,7 @@ def run_pdf_worker_cli(argv: List[str]) -> int:
         return 2
 
     try:
-        with fitz.open(pdf_path) as doc:
-            max_pages = int(config.get('max_pdf_pages', 0) or 0)
-            has_ocr = bool(config.get('has_ocr', False))
-            ocr_lang = config.get('tesseract_languages', 'rus')
-            ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
-            ocr_ready = False
-            pytesseract = None
-            Image = None
-            if has_ocr:
-                try:
-                    import pytesseract as _pytesseract  # type: ignore
-                    from PIL import Image as _Image  # type: ignore
-                    pytesseract = _pytesseract
-                    Image = _Image
-                    ocr_ready = True
-                except Exception:
-                    ocr_ready = False
-
-            for page_index, page in enumerate(doc):
-                if max_pages > 0 and page_index >= max_pages:
-                    break
-
-                text = page.get_text()
-                found.update(_search_in_text_worker(text, keywords_words, keywords_substr))
-                if keywords_all and found.issuperset(keywords_all):
-                    break
-
-                if ocr_ready:
-                    for img in page.get_images(full=True):
-                        xref = img[0]
-                        base_image = doc.extract_image(xref)
-                        if not base_image or "image" not in base_image:
-                            continue
-                        try:
-                            image_data = BytesIO(base_image["image"])
-                            pil_img = Image.open(image_data)
-                            if pil_img.mode == 'P' and 'transparency' in pil_img.info:
-                                pil_img = pil_img.convert('RGBA')
-                            if pil_img.mode == 'RGBA':
-                                pil_img = pil_img.convert('RGB')
-                            elif pil_img.mode not in ('RGB', 'L'):
-                                pil_img = pil_img.convert('RGB')
-                            ocr_text = pytesseract.image_to_string(pil_img, lang=ocr_lang, config=ocr_cfg)
-                            found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
-                            if keywords_all and found.issuperset(keywords_all):
-                                break
-                        except Exception:
-                            continue
-                    if keywords_all and found.issuperset(keywords_all):
-                        break
+        found = _search_in_pdf_core(pdf_path, config, keywords_words, keywords_substr, keywords_all)
 
         print(json.dumps({"ok": True, "found": sorted(found)}), end="")
         return 0
@@ -215,9 +389,7 @@ def search_in_text(text: str) -> Set[str]:
 
     # Поиск по целым словам
     if KEYWORDS_WORDS:
-        # Выделяем слова: последовательности букв/цифр (рус/англ)
-        words = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text_lower)
-        words_set = set(words)
+        words_set = set(WORD_PATTERN.findall(text_lower))
         for kw in KEYWORDS_WORDS:
             if kw in words_set:
                 found.add(kw)
@@ -228,6 +400,170 @@ def search_in_text(text: str) -> Set[str]:
             if kw in text_lower:
                 found.add(kw)
 
+    return found
+
+
+def _keywords_fully_found(found: Set[str]) -> bool:
+    """True, если найдены все ключевые слова."""
+    return bool(KEYWORDS_LOWER) and found.issuperset(KEYWORDS_LOWER)
+
+
+def _search_keywords_in_text(text: str, found: Set[str]) -> None:
+    """Добавляет в found ключи, встречающиеся в text (без лишних аллокаций)."""
+    if not text or not KEYWORDS_LOWER:
+        return
+
+    text_lower = text.lower()
+    if KEYWORDS_SUBSTR:
+        for kw in KEYWORDS_SUBSTR:
+            if kw not in found and kw in text_lower:
+                found.add(kw)
+
+    remaining_words = KEYWORDS_WORDS - found
+    if remaining_words:
+        words_set = set(WORD_PATTERN.findall(text_lower))
+        for kw in remaining_words:
+            if kw in words_set:
+                found.add(kw)
+
+
+def _excel_row_is_empty(row_values) -> bool:
+    for cell in row_values:
+        if cell is None or cell == "":
+            continue
+        if isinstance(cell, str):
+            if cell.strip():
+                return False
+        elif str(cell).strip():
+            return False
+    return True
+
+
+def _search_keywords_in_excel_row(row_values, found: Set[str]) -> bool:
+    """Поиск ключей в одной строке Excel. True — все ключи уже найдены."""
+    parts = []
+    for cell in row_values:
+        if cell is None or cell == "":
+            continue
+        if isinstance(cell, str):
+            text = cell
+        else:
+            text = str(cell).strip()
+        if not text:
+            continue
+
+        if KEYWORDS_SUBSTR:
+            text_lower = text.lower()
+            for kw in KEYWORDS_SUBSTR:
+                if kw not in found and kw in text_lower:
+                    found.add(kw)
+            if _keywords_fully_found(found):
+                return True
+
+        parts.append(text)
+
+    if not parts:
+        return _keywords_fully_found(found)
+
+    if len(parts) == 1:
+        _search_keywords_in_text(parts[0], found)
+    else:
+        _search_keywords_in_text(" ".join(parts), found)
+
+    return _keywords_fully_found(found)
+
+
+def _xlsx_local_tag(tag: str) -> str:
+    return tag.rsplit('}', 1)[-1]
+
+
+def _xlsx_si_text(si_elem) -> str:
+    """Собирает текст из элемента shared string (si)."""
+    parts = []
+    for node in si_elem.iter():
+        if node.text:
+            parts.append(node.text)
+        if node is not si_elem and node.tail:
+            parts.append(node.tail)
+    return ''.join(parts)
+
+
+def _search_in_xlsx_shared_strings(zip_file: zipfile.ZipFile, found: Set[str]) -> bool:
+    """Быстрый поиск по xl/sharedStrings.xml."""
+    shared_name = None
+    for name in zip_file.namelist():
+        if name.lower() == 'xl/sharedstrings.xml':
+            shared_name = name
+            break
+    if not shared_name:
+        return False
+
+    with zip_file.open(shared_name) as xml_file:
+        for _, elem in ET.iterparse(xml_file, events=('end',)):
+            if _xlsx_local_tag(elem.tag) != 'si':
+                continue
+            text = _xlsx_si_text(elem)
+            if text:
+                _search_keywords_in_text(text, found)
+            elem.clear()
+            if _keywords_fully_found(found):
+                return True
+    return _keywords_fully_found(found)
+
+
+def _search_in_xlsx_sheet_xml(raw_xml: bytes, found: Set[str]) -> bool:
+    """Поиск по XML листа (inline-строки и значения ячеек)."""
+    if not raw_xml:
+        return False
+    text = XML_TAG_PATTERN.sub(b' ', raw_xml).decode('utf-8', errors='ignore')
+    text = html.unescape(text)
+    if not text.strip():
+        return False
+    _search_keywords_in_text(text, found)
+    return _keywords_fully_found(found)
+
+
+def _search_in_xlsx_zip_fast(excel_path: str, found: Set[str]) -> bool:
+    """Быстрый поиск в XLSX/XLSM через ZIP+XML (без полного обхода ячеек openpyxl)."""
+    with zipfile.ZipFile(excel_path, 'r') as zip_file:
+        if _search_in_xlsx_shared_strings(zip_file, found):
+            return True
+
+        for name in zip_file.namelist():
+            lower_name = name.lower()
+            if not lower_name.startswith('xl/worksheets/') or not lower_name.endswith('.xml'):
+                continue
+            raw_xml = zip_file.read(name)
+            if _search_in_xlsx_sheet_xml(raw_xml, found):
+                return True
+    return _keywords_fully_found(found)
+
+
+def _search_in_xlsx_openpyxl(excel_path: str, found: Set[str]) -> Set[str]:
+    """Резервный поиск через openpyxl (медленнее, но точнее для нестандартных файлов)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(
+        excel_path,
+        read_only=True,
+        data_only=True,
+        keep_links=False,
+    )
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            empty_streak = 0
+            for row in ws.iter_rows(values_only=True):
+                if _excel_row_is_empty(row):
+                    empty_streak += 1
+                    if empty_streak >= XLSX_EMPTY_ROW_STREAK_LIMIT:
+                        break
+                    continue
+                empty_streak = 0
+                if _search_keywords_in_excel_row(row, found):
+                    return found
+    finally:
+        wb.close()
     return found
 
 
@@ -295,8 +631,54 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         return set()
 
 
-def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
-    """Обработка PDF файлов в отдельном процессе для защиты от падений fitz."""
+def _hidden_subprocess_kwargs() -> dict:
+    """Параметры subprocess без всплывающего окна (Windows)."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0  # SW_HIDE
+    kwargs = {"startupinfo": startupinfo}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
+def _ensure_tesseract_for_pdf(config: dict) -> None:
+    """Настраивает Tesseract перед обработкой PDF в текущем процессе."""
+    if not config.get("has_ocr", False):
+        return
+    try:
+        from tesseract_setup import setup_tesseract
+        setup_tesseract()
+    except Exception:
+        pass
+
+
+def _search_in_pdf_inprocess(pdf_path: str, config: dict) -> Set[str]:
+    """Обработка PDF в текущем процессе (без второго окна приложения)."""
+    payload_config = {
+        "max_pdf_pages": int(config.get("max_pdf_pages", 0) or 0),
+        "has_ocr": bool(config.get("has_ocr", False)),
+        "tesseract_languages": config.get("tesseract_languages", "rus"),
+        "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+    }
+    _ensure_tesseract_for_pdf(payload_config)
+    try:
+        return _search_in_pdf_core(
+            pdf_path,
+            payload_config,
+            KEYWORDS_WORDS,
+            KEYWORDS_SUBSTR,
+            KEYWORDS_LOWER,
+        )
+    except Exception as exc:
+        logging.error(f"Ошибка обработки PDF {pdf_path}: {exc}")
+        return set()
+
+
+def _search_in_pdf_subprocess(pdf_path: str, config: dict) -> Set[str]:
+    """Обработка PDF в отдельном процессе (только через file_processing.py, без GUI)."""
     payload_config = {
         "max_pdf_pages": int(config.get("max_pdf_pages", 0) or 0),
         "has_ocr": bool(config.get("has_ocr", False)),
@@ -311,11 +693,7 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
         json.dumps(sorted(KEYWORDS_SUBSTR), ensure_ascii=False),
         json.dumps(sorted(KEYWORDS_LOWER), ensure_ascii=False),
     ]
-
-    if getattr(sys, "frozen", False):
-        command = [sys.executable, "--pdf-worker", *worker_args]
-    else:
-        command = [sys.executable, os.path.abspath(__file__), "--pdf-worker", *worker_args]
+    command = [sys.executable, os.path.abspath(__file__), "--pdf-worker", *worker_args]
 
     try:
         proc = subprocess.run(
@@ -323,6 +701,7 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
             capture_output=True,
             text=True,
             timeout=PDF_SUBPROCESS_TIMEOUT_SEC,
+            **_hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired:
         logging.error(f"Таймаут обработки PDF в subprocess: {pdf_path}")
@@ -338,17 +717,28 @@ def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
         logging.error(f"Subprocess обработки PDF завершился с ошибкой для {pdf_path}: {details}")
         return set()
 
-    try:
-        response = json.loads(proc.stdout or "{}")
-    except json.JSONDecodeError:
-        logging.error(f"Некорректный ответ subprocess для PDF {pdf_path}")
-        return set()
+    response = _extract_json_from_stdout(proc.stdout or "")
+    if not response:
+        stderr_text = (proc.stderr or "").strip()
+        stdout_preview = (proc.stdout or "").strip()[:300]
+        logging.warning(
+            f"Некорректный ответ subprocess для PDF {pdf_path}. "
+            f"Пробуем fallback в текущем процессе. stderr={stderr_text or '-'}, stdout={stdout_preview or '-'}"
+        )
+        return _search_in_pdf_inprocess(pdf_path, config)
 
     if not response.get("ok", False):
         logging.error(f"Ошибка обработки PDF {pdf_path} в subprocess: {response.get('error', 'unknown')}")
         return set()
 
     return set(response.get("found", []))
+
+
+def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
+    """Обработка PDF: в .exe — в текущем процессе (без моргания окна), иначе — subprocess."""
+    if getattr(sys, "frozen", False):
+        return _search_in_pdf_inprocess(pdf_path, config)
+    return _search_in_pdf_subprocess(pdf_path, config)
 
 
 def search_in_docx(docx_path: str, config: dict) -> Set[str]:
@@ -401,41 +791,59 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
 
 def search_in_excel(excel_path: str, config: dict) -> Set[str]:
     """Обработка Excel файлов с поддержкой старых и новых форматов."""
-    found = set()
+    found: Set[str] = set()
+    if not KEYWORDS_LOWER:
+        return found
+
     try:
         # Пропускаем временные файлы Excel
         if os.path.basename(excel_path).startswith('~$'):
-            return set()
+            return found
 
-        # Определяем расширение файла
         file_ext = os.path.splitext(excel_path)[1].lower()
 
         if file_ext in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
-            # Для новых форматов используем openpyxl
-            try:
-                import openpyxl
-                wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
-                for sheet in wb.sheetnames:
-                    ws = wb[sheet]
-                    for row_index, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                        for cell in row:
-                            if cell and isinstance(cell, str):
-                                found.update(search_in_text(cell))
-            except ImportError:
-                logging.warning(f"Модуль openpyxl не установлен. Пропуск файла {file_ext}")
+            used_fast_path = False
+            if zipfile.is_zipfile(excel_path):
+                try:
+                    if _search_in_xlsx_zip_fast(excel_path, found):
+                        return found
+                    used_fast_path = True
+                except Exception as fast_error:
+                    logging.warning(
+                        f"Быстрый поиск в {excel_path} не удался: {fast_error}. "
+                        "Используется openpyxl."
+                    )
+
+            if not _keywords_fully_found(found):
+                try:
+                    found = _search_in_xlsx_openpyxl(excel_path, found)
+                except ImportError:
+                    if not used_fast_path:
+                        logging.warning(f"Модуль openpyxl не установлен. Пропуск файла {file_ext}")
+                except Exception as openpyxl_error:
+                    logging.error(f"Ошибка openpyxl для {excel_path}: {openpyxl_error}")
 
         elif file_ext in ('.xls', '.xlt'):
-            # Для старых форматов используем xlrd
             try:
                 import xlrd
-                workbook = xlrd.open_workbook(excel_path)
-                for sheet_index in range(workbook.nsheets):
-                    sheet = workbook.sheet_by_index(sheet_index)
-                    for row_index in range(sheet.nrows):
-                        for col_index in range(sheet.ncols):
-                            cell_value = sheet.cell_value(row_index, col_index)
-                            if cell_value and isinstance(cell_value, str):
-                                found.update(search_in_text(str(cell_value)))
+                workbook = xlrd.open_workbook(excel_path, on_demand=True)
+                try:
+                    for sheet_index in range(workbook.nsheets):
+                        sheet = workbook.sheet_by_index(sheet_index)
+                        empty_streak = 0
+                        for row_index in range(sheet.nrows):
+                            row = sheet.row_values(row_index)
+                            if _excel_row_is_empty(row):
+                                empty_streak += 1
+                                if empty_streak >= XLSX_EMPTY_ROW_STREAK_LIMIT:
+                                    break
+                                continue
+                            empty_streak = 0
+                            if _search_keywords_in_excel_row(row, found):
+                                return found
+                finally:
+                    workbook.release_resources()
             except ImportError:
                 logging.warning(f"Модуль xlrd не установлен. Пропуск файла {file_ext}")
             except Exception as e:

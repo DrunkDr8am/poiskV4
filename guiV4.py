@@ -10,6 +10,10 @@ import traceback
 import json
 import hashlib
 import tkinter.font as tkfont
+try:
+    import sqlite3
+except ImportError:  # pragma: no cover - крайне редкий случай для стандартного Python
+    sqlite3 = None
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords, run_pdf_worker_cli
@@ -29,7 +33,7 @@ APP_PASSWORD = "5331"
 INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
 CRASH_LOG_FILE = "crash_log.txt"
-SEARCH_STATE_FILE = "search_state.json"
+SEARCH_STATE_DB_FILE = "search_state.db"
 SEARCH_STATE_VERSION = 1
 
 
@@ -79,6 +83,11 @@ class SearchApp:
         self.search_state_lock = threading.Lock()
         self.active_search_state = None
         self.resume_processed_files = set()
+        self.directory_files_map = {}
+        self._pending_state_updates = 0
+        self._state_flush_interval = 25
+        self._reset_processed_files_table = False
+        self._saved_processed_count = 0
         self.resume_start_count = 0
         self.search_session_status_var = tk.StringVar(value="Статус сессии: нет данных")
         self.search_session_remaining_var = tk.StringVar(value="Осталось файлов: -")
@@ -115,6 +124,7 @@ class SearchApp:
         # Создаем интерфейс
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.init_search_state_storage()
         self.refresh_search_session_ui()
 
         # Центрируем окно
@@ -385,7 +395,7 @@ class SearchApp:
 
         # ---------------- Настройки поиска ----------------
         settings_tab.columnconfigure(1, weight=1)
-        settings_tab.rowconfigure(9, weight=1)
+        settings_tab.rowconfigure(10, weight=1)
         settings_tab.grid_anchor("nw")
 
         # Поля настроек идут по порядку
@@ -444,21 +454,38 @@ class SearchApp:
         max_path_spin = ttk.Spinbox(settings_tab, from_=0, to=10000, textvariable=self.max_path_length_var, width=10)
         max_path_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=7, column=0, sticky=tk.W, pady=(8, 3))
+        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=7, column=0, sticky=tk.NW, pady=(8, 3))
+        self.pre_count_files_var = tk.BooleanVar(value=bool(self.config['config'].get('pre_count_files', True)))
+        launch_mode_frame = ttk.Frame(settings_tab)
+        launch_mode_frame.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+        ttk.Radiobutton(
+            launch_mode_frame,
+            text="Сначала считать файлы, затем искать",
+            variable=self.pre_count_files_var,
+            value=True
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
+        ttk.Radiobutton(
+            launch_mode_frame,
+            text="Сразу запускать поиск (без подсчета)",
+            variable=self.pre_count_files_var,
+            value=False
+        ).grid(row=1, column=0, sticky=tk.W)
+
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=8, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
-        self.theme_toggle_button.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
 
         ttk.Button(
             settings_tab,
             text="Сбросить состояние поиска",
             command=self.reset_search_state
-        ).grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
+        ).grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.2 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.4 | Автор: Андрей ОБИС 2026"
         )
-        footer_info.grid(row=10, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
+        footer_info.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
@@ -581,53 +608,110 @@ class SearchApp:
         logger.setLevel(logging.INFO)
 
     def build_search_signature(self, extensions, keywords_text, max_file_size):
-        """Формирует подпись параметров поиска для проверки совместимости resume-сессии."""
+        """Формирует подпись параметров поиска для проверки совместимости resume-сессии только по выбранным директориям."""
         signature_payload = {
             "directories": sorted(os.path.normcase(os.path.normpath(path)) for path in self.directories_list),
-            "extensions": sorted(ext.lower() for ext in extensions),
             "keywords_sha256": hashlib.sha256(keywords_text.encode("utf-8")).hexdigest(),
-            "max_file_size": max_file_size,
-            "max_path_length": str(self.max_path_length_var.get()),
-            "search_images": bool(self.search_images_var.get()),
-            "max_pdf_pages": str(self.max_pdf_pages_var.get()),
         }
         payload_json = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
+    def init_search_state_storage(self):
+        """Инициализирует хранилище состояния поиска (SQLite-only)."""
+        if sqlite3 is None:
+            raise RuntimeError("Модуль sqlite3 недоступен в текущей среде Python")
+        self._init_search_state_db()
+
+    def _init_search_state_db(self):
+        """Создает SQLite-таблицы для состояния поиска."""
+        with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS state_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_files (
+                    path TEXT PRIMARY KEY
+                )
+                """
+            )
+            conn.commit()
+
     def load_search_state(self):
-        """Читает файл состояния предыдущего поиска."""
-        if not os.path.exists(SEARCH_STATE_FILE):
+        """Читает состояние предыдущего поиска из SQLite."""
+        return self._load_search_state_from_sqlite()
+
+    def _load_search_state_from_sqlite(self):
+        """Читает состояние из SQLite."""
+        if sqlite3 is None or not os.path.exists(SEARCH_STATE_DB_FILE):
             return None
         try:
-            with open(SEARCH_STATE_FILE, "r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
-            if not isinstance(state, dict):
-                return None
-            if state.get("version") != SEARCH_STATE_VERSION:
-                return None
-            return state
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                row = conn.execute(
+                    "SELECT value FROM state_kv WHERE key = ?",
+                    ("state_json",)
+                ).fetchone()
+                if not row:
+                    return None
+                state = json.loads(row[0])
+                if not isinstance(state, dict):
+                    return None
+                if state.get("version") != SEARCH_STATE_VERSION:
+                    return None
+                processed = [r[0] for r in conn.execute("SELECT path FROM processed_files").fetchall()]
+                state["processed_files"] = processed
+                state["processed_count"] = len(processed)
+                total_files = int(state.get("total_files", 0))
+                state["remaining_count"] = max(0, total_files - len(processed))
+                return state
         except Exception as exc:
-            logging.warning(f"Не удалось прочитать {SEARCH_STATE_FILE}: {exc}")
+            logging.warning(f"Не удалось прочитать {SEARCH_STATE_DB_FILE}: {exc}")
             return None
 
     def save_search_state(self):
-        """Сохраняет текущее состояние поиска атомарно."""
+        """Сохраняет текущее состояние поиска в SQLite."""
         with self.search_state_lock:
             if not self.active_search_state:
                 return
             state_copy = dict(self.active_search_state)
-        tmp_path = f"{SEARCH_STATE_FILE}.tmp"
+        self._save_search_state_to_sqlite(state_copy)
+
+    def _save_search_state_to_sqlite(self, state_copy):
+        """Сохраняет состояние в SQLite."""
         try:
-            with open(tmp_path, "w", encoding="utf-8") as tmp_file:
-                json.dump(state_copy, tmp_file, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, SEARCH_STATE_FILE)
+            processed_files = list(dict.fromkeys(state_copy.get("processed_files", [])))
+            state_for_db = dict(state_copy)
+            state_for_db["processed_files"] = []
+            with self.search_state_lock:
+                should_reset_table = self._reset_processed_files_table
+                saved_processed_count = self._saved_processed_count
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                conn.execute("BEGIN")
+                conn.execute(
+                    "INSERT OR REPLACE INTO state_kv(key, value) VALUES(?, ?)",
+                    ("state_json", json.dumps(state_for_db, ensure_ascii=False))
+                )
+                if should_reset_table:
+                    conn.execute("DELETE FROM processed_files")
+                    saved_processed_count = 0
+                new_processed_files = processed_files[saved_processed_count:]
+                if new_processed_files:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO processed_files(path) VALUES(?)",
+                        [(p,) for p in new_processed_files]
+                    )
+                    saved_processed_count += len(new_processed_files)
+                conn.commit()
+            with self.search_state_lock:
+                self._reset_processed_files_table = False
+                self._saved_processed_count = saved_processed_count
         except Exception as exc:
-            logging.error(f"Не удалось сохранить {SEARCH_STATE_FILE}: {exc}")
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+            logging.error(f"Не удалось сохранить {SEARCH_STATE_DB_FILE}: {exc}")
 
     @staticmethod
     def format_session_status(status):
@@ -727,19 +811,22 @@ class SearchApp:
             return
 
         try:
-            if os.path.exists(SEARCH_STATE_FILE):
-                os.remove(SEARCH_STATE_FILE)
-            tmp_path = f"{SEARCH_STATE_FILE}.tmp"
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError as exc:
-            messagebox.showerror("Ошибка", f"Не удалось сбросить состояние поиска:\n{exc}")
+            self._init_search_state_db()
+            with sqlite3.connect(SEARCH_STATE_DB_FILE, timeout=5) as conn:
+                conn.execute("DELETE FROM state_kv")
+                conn.execute("DELETE FROM processed_files")
+                conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось очистить SQLite-состояние:\n{exc}")
             return
 
         with self.search_state_lock:
             self.active_search_state = None
             self.resume_processed_files = set()
             self.resume_start_count = 0
+            self._pending_state_updates = 0
+            self._reset_processed_files_table = False
+            self._saved_processed_count = 0
 
         self.refresh_search_session_ui()
         messagebox.showinfo("Готово", "Состояние поиска успешно сброшено.")
@@ -747,8 +834,11 @@ class SearchApp:
     def prepare_search_state(self, signature, total_files, resume_state=None):
         """Инициализирует состояние поиска (новое или продолжение)."""
         now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+        self._pending_state_updates = 0
         if resume_state:
             processed_files = list(dict.fromkeys(resume_state.get("processed_files", [])))
+            self._reset_processed_files_table = False
+            self._saved_processed_count = len(processed_files)
             resolved_total = max(int(total_files), int(resume_state.get("total_files", total_files)))
             self.active_search_state = {
                 **resume_state,
@@ -767,6 +857,8 @@ class SearchApp:
                 "total_files": resolved_total,
             }
         else:
+            self._reset_processed_files_table = True
+            self._saved_processed_count = 0
             self.active_search_state = {
                 "version": SEARCH_STATE_VERSION,
                 "status": "running",
@@ -789,6 +881,7 @@ class SearchApp:
 
     def update_search_state_checkpoint(self, file_path, had_matches, error_text="", file_status="no_match", skip_reason=""):
         """Обновляет состояние после обработки файла."""
+        should_flush = False
         with self.search_state_lock:
             if not self.active_search_state:
                 return
@@ -816,11 +909,16 @@ class SearchApp:
             matched_count = int(self.active_search_state.get("matched_count", 0))
             skipped_count = int(self.active_search_state.get("skipped_count", 0))
             error_count = int(self.active_search_state.get("error_count", 0))
+            self._pending_state_updates += 1
+            should_flush = self._pending_state_updates >= self._state_flush_interval
 
         self.dashboard_found = matched_count
         self.dashboard_skipped = skipped_count
         self.dashboard_errors = error_count
-        self.save_search_state()
+        if should_flush:
+            self.save_search_state()
+            with self.search_state_lock:
+                self._pending_state_updates = 0
         self.safe_after(0, self.refresh_search_session_ui)
         self.safe_after(0, self.update_dashboard_labels)
 
@@ -836,6 +934,7 @@ class SearchApp:
             self.active_search_state["remaining_count"] = max(0, total_files - len(self.resume_processed_files))
             if error_text:
                 self.active_search_state["last_error"] = error_text
+            self._pending_state_updates = 0
         self.save_search_state()
         self.safe_after(0, self.refresh_search_session_ui)
 
@@ -1016,6 +1115,18 @@ class SearchApp:
                     progress_text += f" | {display_name}"
 
                 self.current_file.set(progress_text)
+        else:
+            if file_name:
+                status_text = f"Обработано: {self.processed_files} файлов"
+                if file_name.startswith("Завершена обработка:"):
+                    status_text += f" | {file_name}"
+                elif file_name.startswith("Начат:"):
+                    status_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
+                elif file_name == "Поиск завершен":
+                    status_text = f"Поиск завершен! Обработано файлов: {self.processed_files}"
+                else:
+                    status_text += f" | {file_name}"
+                self.current_file.set(status_text)
 
         # Принудительно обновляем прогрессбар
         self.progress_bar.update_idletasks()
@@ -1157,16 +1268,16 @@ class SearchApp:
             self.results_table.item(self.hovered_result_item, tags=())
             self.hovered_result_item = None
 
-    def count_files_to_process(self, directory, extensions):
-        """Подсчет общего количества файлов для обработки"""
-        count = 0
+    def collect_files_to_process(self, directory, extensions):
+        """Собирает список файлов для обработки в директории."""
+        collected = []
         for root, _, files in os.walk(directory):
             for file in files:
                 file_path = os.path.join(root, file)
                 # Используем fnmatch для проверки соответствия расширениям
                 if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                    count += 1
-        return count
+                    collected.append(file_path)
+        return collected
 
     def get_selected_extensions(self):
         """Возвращает список расширений, выбранных галочками."""
@@ -1222,16 +1333,21 @@ class SearchApp:
             messagebox.showerror("Ошибка", "Макс. размер файла не может быть отрицательным.")
             return
 
-        # Подсчитываем общее количество файлов для прогресса
+        # В зависимости от режима либо считаем файлы заранее, либо запускаем сразу.
+        pre_count_enabled = bool(self.pre_count_files_var.get())
         calculated_total = 0
-        for directory in self.directories_list:
-            calculated_total += self.count_files_to_process(directory, extensions)
+        self.directory_files_map = {}
+        if pre_count_enabled:
+            for directory in self.directories_list:
+                files_in_directory = self.collect_files_to_process(directory, extensions)
+                self.directory_files_map[directory] = files_in_directory
+                calculated_total += len(files_in_directory)
 
         signature = self.build_search_signature(extensions, keywords, max_file_size)
         resume_state = None
         self.resume_processed_files = set()
         self.resume_start_count = 0
-        self.total_files = calculated_total
+        self.total_files = calculated_total if pre_count_enabled else 0
         resume_matched_count = 0
         resume_skipped_count = 0
         resume_error_count = 0
@@ -1274,7 +1390,7 @@ class SearchApp:
                     f"осталось {max(0, self.total_files - self.resume_start_count)}"
                 )
 
-        if self.total_files == 0:
+        if pre_count_enabled and self.total_files == 0:
             messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
             return
 
@@ -1329,6 +1445,13 @@ class SearchApp:
         self.is_searching = True
         self.is_paused = False
         self.processed_files = self.resume_start_count
+        if pre_count_enabled:
+            self.progress_bar.config(mode="determinate")
+            self.progress_value.set(0)
+        else:
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            self.current_file.set(f"Обработано: {self.processed_files} файлов | Поиск запущен без предварительного подсчета")
 
         # Запускаем поиск в отдельном потоке
         self.search_thread = threading.Thread(
@@ -1403,7 +1526,8 @@ class SearchApp:
                         self.add_live_result,
                         lambda: self.is_paused,
                         self.resume_processed_files,
-                        self.update_search_state_checkpoint
+                        self.update_search_state_checkpoint,
+                        self.directory_files_map.get(directory)
                     )
 
                     # Показываем результаты для текущей директории
@@ -1487,6 +1611,9 @@ class SearchApp:
 
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="determinate")
+        self.directory_files_map = {}
         self.start_button.config(state=tk.NORMAL)
         self.pause_button.config(state=tk.DISABLED, text="Пауза")
         self.stop_button.config(state=tk.DISABLED)
@@ -1512,6 +1639,7 @@ class SearchApp:
             'directories': '; '.join(self.directories_list) if self.directories_list else '.',
             'directory': self.directories_list[0] if self.directories_list else current_cfg.get('directory', '.'),
             'theme': self.theme_var.get(),
+            'pre_count_files': 'true' if self.pre_count_files_var.get() else 'false',
             'threads': str(threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',

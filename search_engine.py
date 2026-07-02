@@ -1,7 +1,7 @@
 import os
 import fnmatch
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Set
 
 import logging
@@ -49,31 +49,39 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                  max_file_size: int = 10, config: dict = None, progress_callback: callable = None,
                  start_count: int = 0, is_searching_func: callable = None,
                  result_callback: callable = None, is_paused_func: callable = None,
-                 processed_files_set: set = None, file_completed_callback: callable = None) -> Dict[str, Set[str]]:
+                 processed_files_set: set = None, file_completed_callback: callable = None,
+                 candidate_files: List[str] = None) -> Dict[str, Set[str]]:
     """Многопоточный поиск файлов с поддержкой offset и проверкой флага остановки"""
     results: Dict[str, Set[str]] = {}
 
-    # Собираем все файлы для обработки
+    # Список файлов может быть передан заранее (чтобы избежать повторного обхода ФС).
     files_to_process: List[str] = []
     already_processed_set = processed_files_set or set()
     skipped_processed = 0
 
-    for root, _, files in os.walk(root_dir):
-        if not _wait_if_paused(is_paused_func, is_searching_func):
-            break
+    if candidate_files is not None:
+        for file_path in candidate_files:
+            if file_path in already_processed_set:
+                skipped_processed += 1
+                continue
+            files_to_process.append(file_path)
+    else:
+        for root, _, files in os.walk(root_dir):
+            if not _wait_if_paused(is_paused_func, is_searching_func):
+                break
 
-        # Проверяем флаг остановки перед обработкой каждой папки
-        if is_searching_func and not is_searching_func():
-            logging.info("Поиск остановлен пользователем при сборе файлов")
-            break
+            # Проверяем флаг остановки перед обработкой каждой папки
+            if is_searching_func and not is_searching_func():
+                logging.info("Поиск остановлен пользователем при сборе файлов")
+                break
 
-        for file in files:
-            file_path = os.path.join(root, file)
-            if any(fnmatch.fnmatch(file, ext_pattern) for ext_pattern in extensions):
-                if file_path in already_processed_set:
-                    skipped_processed += 1
-                    continue
-                files_to_process.append(file_path)
+            for file in files:
+                file_path = os.path.join(root, file)
+                if any(fnmatch.fnmatch(file, ext_pattern) for ext_pattern in extensions):
+                    if file_path in already_processed_set:
+                        skipped_processed += 1
+                        continue
+                    files_to_process.append(file_path)
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")
     if skipped_processed:
@@ -98,29 +106,40 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
         except OSError as e:
             logging.error(f"Не удалось проверить размер файла результатов {output_file}: {e}")
 
-    # Обрабатываем файлы в несколько потоков
+    # Обрабатываем файлы в несколько потоков, подавая задачи порциями.
     executor = ThreadPoolExecutor(max_workers=max_workers)
     stop_requested = False
+    completed_count = start_count
     try:
-        future_to_file = {
-            executor.submit(
-                _process_file_with_start,
-                file_path,
-                extensions,
-                max_file_size,
-                config,
-                progress_callback,
-                is_searching_func,
-                is_paused_func
-            ): file_path
-            for file_path in files_to_process
-        }
+        files_iter = iter(files_to_process)
+        in_flight = {}
+        max_in_flight = max(1, max_workers * 2)
 
-        for i, future in enumerate(as_completed(future_to_file)):
+        def submit_next():
+            while len(in_flight) < max_in_flight:
+                try:
+                    file_path = next(files_iter)
+                except StopIteration:
+                    break
+                future = executor.submit(
+                    _process_file_with_start,
+                    file_path,
+                    extensions,
+                    max_file_size,
+                    config,
+                    progress_callback,
+                    is_searching_func,
+                    is_paused_func
+                )
+                in_flight[future] = file_path
+
+        submit_next()
+
+        while in_flight:
             if not _wait_if_paused(is_paused_func, is_searching_func):
                 logging.info("Поиск остановлен пользователем во время паузы")
                 stop_requested = True
-                for f in future_to_file:
+                for f in in_flight:
                     f.cancel()
                 break
 
@@ -129,63 +148,68 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 logging.info("Поиск остановлен пользователем во время обработки файлов")
                 stop_requested = True
                 # Отменяем все оставшиеся задачи
-                for f in future_to_file:
+                for f in in_flight:
                     f.cancel()
                 break
 
-            file_path = future_to_file[future]
-            total_processed = start_count + i + 1
+            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                file_path = in_flight.pop(future)
+                completed_count += 1
+                total_processed = completed_count
 
-            # Вызываем callback для обновления прогресса в GUI
-            if progress_callback and callable(progress_callback):
-                try:
-                    # Для завершения файла обновляем только счетчик прогресса,
-                    # чтобы не перезатирать статус "Начат: <файл>".
-                    progress_callback("", total_processed)
-                except Exception as e:
-                    logging.error(f"Ошибка в callback обновления прогресса: {e}")
-
-            file_had_matches = False
-            file_error = ""
-            file_status = "no_match"
-            skip_reason = ""
-            try:
-                payload = future.result(timeout=300)
-                if isinstance(payload, tuple) and len(payload) >= 4:
-                    result, file_status, file_error, skip_reason = payload[0], payload[1], payload[2] or "", payload[3] or ""
-                elif isinstance(payload, tuple) and len(payload) >= 3:
-                    result, file_status, file_error = payload[0], payload[1], payload[2] or ""
-                else:
-                    result = payload or {}
-                    file_status = "matched" if result else "no_match"
-                if result:
-                    file_had_matches = True
-                    results.update(result)
-                    if result_callback and callable(result_callback):
-                        try:
-                            for path, keywords_found in result.items():
-                                result_callback(path, keywords_found)
-                        except Exception as e:
-                            logging.error(f"Ошибка в callback результата: {e}")
-                    if output_handle:
-                        for path, keywords_found in result.items():
-                            output_handle.write(f"Файл: {path}\n")
-                            output_handle.write(f"Найденные ключевые слова: {', '.join(keywords_found)}\n\n")
-                            output_handle.flush()
-            except FuturesTimeoutError:
-                file_status = "error"
-                file_error = f"Таймаут при обработке файла {file_path}"
-                logging.error(file_error)
-            except Exception as e:
-                file_status = "error"
-                file_error = f"Ошибка при обработке файла {file_path}: {e}"
-                logging.error(file_error)
-            finally:
-                if file_completed_callback and callable(file_completed_callback):
+                # Вызываем callback для обновления прогресса в GUI
+                if progress_callback and callable(progress_callback):
                     try:
-                        file_completed_callback(file_path, file_had_matches, file_error, file_status, skip_reason)
-                    except Exception as callback_error:
-                        logging.error(f"Ошибка в callback завершения файла: {callback_error}")
+                        # Для завершения файла обновляем только счетчик прогресса,
+                        # чтобы не перезатирать статус "Начат: <файл>".
+                        progress_callback("", total_processed)
+                    except Exception as e:
+                        logging.error(f"Ошибка в callback обновления прогресса: {e}")
+
+                file_had_matches = False
+                file_error = ""
+                file_status = "no_match"
+                skip_reason = ""
+                try:
+                    payload = future.result(timeout=300)
+                    if isinstance(payload, tuple) and len(payload) >= 4:
+                        result, file_status, file_error, skip_reason = payload[0], payload[1], payload[2] or "", payload[3] or ""
+                    elif isinstance(payload, tuple) and len(payload) >= 3:
+                        result, file_status, file_error = payload[0], payload[1], payload[2] or ""
+                    else:
+                        result = payload or {}
+                        file_status = "matched" if result else "no_match"
+                    if result:
+                        file_had_matches = True
+                        results.update(result)
+                        if result_callback and callable(result_callback):
+                            try:
+                                for path, keywords_found in result.items():
+                                    result_callback(path, keywords_found)
+                            except Exception as e:
+                                logging.error(f"Ошибка в callback результата: {e}")
+                        if output_handle:
+                            for path, keywords_found in result.items():
+                                output_handle.write(f"Файл: {path}\n")
+                                output_handle.write(f"Найденные ключевые слова: {', '.join(keywords_found)}\n\n")
+                                output_handle.flush()
+                except FuturesTimeoutError:
+                    file_status = "error"
+                    file_error = f"Таймаут при обработке файла {file_path}"
+                    logging.error(file_error)
+                except Exception as e:
+                    file_status = "error"
+                    file_error = f"Ошибка при обработке файла {file_path}: {e}"
+                    logging.error(file_error)
+                finally:
+                    if file_completed_callback and callable(file_completed_callback):
+                        try:
+                            file_completed_callback(file_path, file_had_matches, file_error, file_status, skip_reason)
+                        except Exception as callback_error:
+                            logging.error(f"Ошибка в callback завершения файла: {callback_error}")
+
+            submit_next()
     finally:
         # При остановке не блокируемся, ожидая завершения всех worker'ов.
         if stop_requested:

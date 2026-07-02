@@ -34,6 +34,7 @@ def load_config(config_file="config.txt"):
         'directories': '.',
         'directory': '.',
         'theme': 'Светлая',
+        'pre_count_files': 'true',
         'threads': '4',
         'output_file': 'search_results.txt',
         'search_images': 'false',
@@ -41,10 +42,8 @@ def load_config(config_file="config.txt"):
         'log_file': 'search_log.txt',
         'tesseract_languages': 'rus',
         'tesseract_config': '--oem 3 --psm 6',
-        # Новые параметры для тонкой настройки
-        'max_image_size_mb': '10',
+        # Параметры для тонкой настройки
         'max_pdf_pages': '0',  # 0 = без ограничения
-        'max_excel_rows_per_sheet': '0',  # 0 = без ограничения
         'max_path_length': '240',
     }
 
@@ -67,6 +66,7 @@ def load_config(config_file="config.txt"):
     directory = config.get('Settings', 'directory', fallback=defaults['directory'])
     directories_raw = config.get('Settings', 'directories', fallback=defaults['directories'])
     theme = config.get('Settings', 'theme', fallback=defaults['theme'])
+    pre_count_files = config.getboolean('Settings', 'pre_count_files', fallback=True)
     threads = _safe_getint(config, 'Settings', 'threads', int(defaults['threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
@@ -74,12 +74,8 @@ def load_config(config_file="config.txt"):
     log_file = config.get('Settings', 'log_file', fallback=defaults['log_file'])
     tesseract_languages = config.get('Settings', 'tesseract_languages', fallback=defaults['tesseract_languages'])
     tesseract_config = config.get('Settings', 'tesseract_config', fallback=defaults['tesseract_config'])
-    max_image_size_mb = _safe_getint(config, 'Settings', 'max_image_size_mb', int(defaults['max_image_size_mb']))
     max_pdf_pages = _safe_getint(config, 'Settings', 'max_pdf_pages', int(defaults['max_pdf_pages']))
     max_path_length = _safe_getint(config, 'Settings', 'max_path_length', int(defaults['max_path_length']))
-    max_excel_rows_per_sheet = _safe_getint(
-        config, 'Settings', 'max_excel_rows_per_sheet', int(defaults['max_excel_rows_per_sheet'])
-    )
 
     # Очищаем значения от пробелов
     extensions = [ext.strip() for ext in extensions]
@@ -104,6 +100,7 @@ def load_config(config_file="config.txt"):
         'directories': directories,
         'directory': directory,
         'theme': theme,
+        'pre_count_files': pre_count_files,
         'threads': threads,
         'output_file': output_file,
         'search_images': search_images,
@@ -111,10 +108,8 @@ def load_config(config_file="config.txt"):
         'log_file': log_file,
         'tesseract_languages': tesseract_languages,
         'tesseract_config': tesseract_config,
-        'max_image_size_mb': max_image_size_mb,
         'max_pdf_pages': max_pdf_pages,
         'max_path_length': max_path_length,
-        'max_excel_rows_per_sheet': max_excel_rows_per_sheet,
     }
 
 def create_default_config():
@@ -135,6 +130,9 @@ directory = .
 # Тема интерфейса
 theme = Светлая
 
+# Предварительно считать количество файлов перед запуском поиска
+pre_count_files = true
+
 # Количество потоков для обработки
 threads = 4
 
@@ -154,17 +152,12 @@ log_file = search_log.txt
 tesseract_languages = rus
 tesseract_config = --oem 3 --psm 6
 
-# Максимальный размер изображения для OCR (МБ)
-max_image_size_mb = 10
-
 # Максимальное количество страниц PDF для анализа (0 = без ограничения)
 max_pdf_pages = 0
 
 # Максимальная длина пути к файлу (символов)
 max_path_length = 240
 
-# Максимальное количество строк Excel на лист (0 = без ограничения)
-max_excel_rows_per_sheet = 0
 """
 
     with open("config.txt", "w", encoding="utf-8") as f:
