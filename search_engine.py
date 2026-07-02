@@ -11,6 +11,14 @@ from file_processing import process_file_with_meta  # Импортируем ф�
 SEARCH_RESULTS_ENCODING = 'utf-8-sig'
 
 
+def _file_size_sort_key(file_path: str) -> int:
+    """Ключ сортировки: сначала маленькие файлы, тяжёлые — в конец очереди."""
+    try:
+        return os.path.getsize(file_path)
+    except OSError:
+        return 0
+
+
 def _wait_if_paused(is_paused_func: callable = None, is_searching_func: callable = None) -> bool:
     """Ожидание снятия паузы. Возвращает False, если поиск остановлен."""
     while is_paused_func and is_paused_func():
@@ -82,6 +90,8 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                         skipped_processed += 1
                         continue
                     files_to_process.append(file_path)
+
+    files_to_process.sort(key=_file_size_sort_key)
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")
     if skipped_processed:
@@ -161,9 +171,11 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 # Вызываем callback для обновления прогресса в GUI
                 if progress_callback and callable(progress_callback):
                     try:
-                        # Для завершения файла обновляем только счетчик прогресса,
-                        # чтобы не перезатирать статус "Начат: <файл>".
-                        progress_callback("", total_processed)
+                        progress_callback(
+                            f"Готово: {os.path.basename(file_path)}",
+                            total_processed,
+                            len(in_flight),
+                        )
                     except Exception as e:
                         logging.error(f"Ошибка в callback обновления прогресса: {e}")
 

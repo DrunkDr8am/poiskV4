@@ -16,11 +16,14 @@ except ImportError:  # pragma: no cover - крайне редкий случай
     sqlite3 = None
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
-from file_processing import load_keywords, run_pdf_worker_cli
+from file_processing import load_keywords, run_pdf_worker_cli, ARCHIVE_MEMBER_SEP
 from search_engine import search_files
 from configparser import ConfigParser
 
 import fnmatch
+import zipfile
+import tempfile
+import shutil
 
 # Глобальные флаги для доступности функций
 HAS_PDF = False
@@ -29,7 +32,7 @@ HAS_EXCEL = False
 HAS_7Z = False
 HAS_RAR = False
 HAS_OCR = False
-APP_PASSWORD = "5331"
+APP_PASSWORD = "1511"
 INVALID_PASSWORD_CLOSE_MS = 300_000
 INVALID_PASSWORD_TICK_MS = 1000
 CRASH_LOG_FILE = "crash_log.txt"
@@ -77,6 +80,7 @@ class SearchApp:
         self.is_closing = False
         self.config_dirty = False
         self._updating_threads_var = False
+        self._updating_ocr_threads_var = False
         self.invalid_password_timer_id = None
         self.invalid_password_deadline_ms = None
         self.search_file_handler = None
@@ -97,6 +101,7 @@ class SearchApp:
         self.dashboard_skipped_var = tk.StringVar(value="0")
         self.dashboard_errors_var = tk.StringVar(value="0")
         self.dashboard_found = 0
+        self.found_results = {}
         self.dashboard_skipped = 0
         self.dashboard_errors = 0
         self.dashboard_skip_reasons = {
@@ -111,6 +116,7 @@ class SearchApp:
         self.theme_var = tk.StringVar(value="Светлая")
         self.total_files = 0
         self.processed_files = 0
+        self.search_in_flight_count = 0
         self.search_start_time = None  # Время начала поиска
         self.search_end_time = None  # Время окончания поиска
         self.max_result_file_text_px = 0
@@ -145,6 +151,12 @@ class SearchApp:
         return cpu_count - 2 if cpu_count > 2 else 1
 
     @staticmethod
+    def get_default_ocr_threads_count():
+        """Рекомендуемое число OCR-потоков: 2 или меньше при слабом CPU."""
+        cpu_count = os.cpu_count() or 1
+        return min(2, max(1, cpu_count))
+
+    @staticmethod
     def get_max_threads_count():
         """Максимально допустимое количество потоков на текущем компьютере."""
         return max(1, os.cpu_count() or 1)
@@ -159,6 +171,41 @@ class SearchApp:
         threads = max(1, min(threads, max_threads))
         self.threads_var.set(str(threads))
         return threads
+
+    def normalize_ocr_threads_value(self):
+        """Нормализует количество OCR-потоков в диапазон [1, cpu_count]."""
+        max_threads = self.get_max_threads_count()
+        try:
+            ocr_threads = int(self.ocr_threads_var.get())
+        except (TypeError, ValueError):
+            ocr_threads = self.get_default_ocr_threads_count()
+        ocr_threads = max(1, min(ocr_threads, max_threads))
+        self.ocr_threads_var.set(str(ocr_threads))
+        return ocr_threads
+
+    def on_ocr_threads_var_change(self, *_args):
+        """Не дает вручную ввести число OCR-потоков больше доступного."""
+        if self._updating_ocr_threads_var:
+            return
+
+        value = self.ocr_threads_var.get()
+        if value == "":
+            return
+
+        filtered = "".join(ch for ch in value if ch.isdigit())
+        max_threads = self.get_max_threads_count()
+
+        if not filtered:
+            new_value = "1"
+        else:
+            new_value = str(min(max(1, int(filtered)), max_threads))
+
+        if new_value != value:
+            self._updating_ocr_threads_var = True
+            try:
+                self.ocr_threads_var.set(new_value)
+            finally:
+                self._updating_ocr_threads_var = False
 
     def on_threads_var_change(self, *_args):
         """Не дает вручную ввести число потоков больше доступного."""
@@ -327,6 +374,12 @@ class SearchApp:
                 card.bind("<Button-1>", self.show_skip_details)
                 title_label.bind("<Button-1>", self.show_skip_details)
                 value_label.bind("<Button-1>", self.show_skip_details)
+            elif title == "Найдено":
+                self.dashboard_found_card = card
+                self.dashboard_found_card.configure(cursor="hand2")
+                card.bind("<Button-1>", self.show_found_results)
+                title_label.bind("<Button-1>", self.show_found_results)
+                value_label.bind("<Button-1>", self.show_found_results)
 
         ttk.Label(search_tab, text="Прогресс:").grid(row=2, column=0, sticky=tk.W, pady=5)
         progress_frame = ttk.Frame(search_tab)
@@ -395,7 +448,7 @@ class SearchApp:
 
         # ---------------- Настройки поиска ----------------
         settings_tab.columnconfigure(1, weight=1)
-        settings_tab.rowconfigure(10, weight=1)
+        settings_tab.rowconfigure(11, weight=1)
         settings_tab.grid_anchor("nw")
 
         # Поля настроек идут по порядку
@@ -433,31 +486,40 @@ class SearchApp:
         )
         threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Макс. размер файла (МБ, 0=без лимита):").grid(row=3, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="OCR-потоки (Tesseract):").grid(row=3, column=0, sticky=tk.W, pady=3)
+        default_ocr_threads = str(self.config['config'].get('ocr_threads', self.get_default_ocr_threads_count()))
+        self.ocr_threads_var = tk.StringVar(value=default_ocr_threads)
+        self.ocr_threads_var.trace_add("write", self.on_ocr_threads_var_change)
+        ocr_threads_spin = ttk.Spinbox(
+            settings_tab, from_=1, to=self.get_max_threads_count(), textvariable=self.ocr_threads_var, width=8
+        )
+        ocr_threads_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(settings_tab, text="Макс. размер файла (МБ, 0=без лимита):").grid(row=4, column=0, sticky=tk.W, pady=3)
         self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
         max_size_spin = ttk.Spinbox(settings_tab, from_=0, to=1000, textvariable=self.max_size_var, width=8)
-        max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
+        max_size_spin.grid(row=4, column=1, sticky=tk.W, pady=3)
 
         self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
-        ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=4, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=5, column=0, sticky=tk.W, pady=3)
         ttk.Checkbutton(settings_tab, text="Включить OCR", variable=self.search_images_var).grid(
-            row=4, column=1, sticky=tk.W, pady=3
+            row=5, column=1, sticky=tk.W, pady=3
         )
 
-        ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=5, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
         self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
         max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
-        max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
+        max_pdf_pages_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=7, column=0, sticky=tk.W, pady=3)
         self.max_path_length_var = tk.StringVar(value=str(self.config['config'].get('max_path_length', 240)))
         max_path_spin = ttk.Spinbox(settings_tab, from_=0, to=10000, textvariable=self.max_path_length_var, width=10)
-        max_path_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
+        max_path_spin.grid(row=7, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=7, column=0, sticky=tk.NW, pady=(8, 3))
+        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=8, column=0, sticky=tk.NW, pady=(8, 3))
         self.pre_count_files_var = tk.BooleanVar(value=bool(self.config['config'].get('pre_count_files', True)))
         launch_mode_frame = ttk.Frame(settings_tab)
-        launch_mode_frame.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+        launch_mode_frame.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
         ttk.Radiobutton(
             launch_mode_frame,
             text="Сначала считать файлы, затем искать",
@@ -471,21 +533,21 @@ class SearchApp:
             value=False
         ).grid(row=1, column=0, sticky=tk.W)
 
-        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=8, column=0, sticky=tk.W, pady=(8, 3))
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=9, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
-        self.theme_toggle_button.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button.grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
 
         ttk.Button(
             settings_tab,
             text="Сбросить состояние поиска",
             command=self.reset_search_state
-        ).grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
+        ).grid(row=10, column=1, sticky=tk.W, pady=(8, 3))
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.4 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.5 | Автор: Андрей ОБИС 2026"
         )
-        footer_info.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
+        footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
@@ -784,9 +846,33 @@ class SearchApp:
     def update_dashboard_labels(self):
         """Обновляет значения карточек дашборда."""
         self.dashboard_processed_var.set(str(self.processed_files))
-        self.dashboard_found_var.set(str(self.dashboard_found))
+        found_count = len(self.found_results) if self.found_results else self.dashboard_found
+        self.dashboard_found_var.set(str(found_count))
         self.dashboard_skipped_var.set(str(self.dashboard_skipped))
         self.dashboard_errors_var.set(str(self.dashboard_errors))
+
+    def show_found_results(self, _event=None):
+        """Показывает все найденные файлы в таблице результатов."""
+        if not self.found_results:
+            messagebox.showinfo("Найдено", "Совпадений пока нет.", parent=self.root)
+            return
+
+        for item in self.results_table.get_children():
+            self.results_table.delete(item)
+        self.hovered_result_item = None
+        self.max_result_file_text_px = 0
+
+        for file_path in sorted(self.found_results.keys()):
+            keywords_str = ', '.join(sorted(self.found_results[file_path]))
+            self._insert_live_result_row(keywords_str, file_path)
+
+        children = self.results_table.get_children()
+        if children:
+            first_item = children[0]
+            self.results_table.selection_set(first_item)
+            self.results_table.focus(first_item)
+            self.results_table.see(first_item)
+            self.results_table.update_idletasks()
 
     def show_skip_details(self, _event=None):
         """Показывает детальную разбивку причин пропусков."""
@@ -1086,55 +1172,85 @@ class SearchApp:
         self.progress_value.set(0)
         self.current_file.set("")
         self.processed_files = 0
+        self.found_results = {}
+        self.dashboard_found = 0
 
-    def update_progress(self, file_name=""):
+    def update_progress(self, file_name="", in_flight=None):
         """Обновление прогресса с информацией о прогрессе"""
-        logging.debug(f"Updating progress: {self.processed_files}/{self.total_files}, file: {file_name}")
+        if in_flight is not None:
+            self.search_in_flight_count = max(0, int(in_flight))
+
+        logging.debug(
+            f"Updating progress: {self.processed_files}/{self.total_files}, "
+            f"file: {file_name}, in_flight: {self.search_in_flight_count}"
+        )
 
         if self.total_files > 0:
             progress = (self.processed_files / self.total_files) * 100
             self.progress_value.set(progress)
 
-            # Обновляем текст с информацией о прогрессе
+            progress_text = f"Обработано: {self.processed_files}/{self.total_files} файлов"
+            if self.search_in_flight_count > 0:
+                progress_text += f" | в работе: {self.search_in_flight_count}"
+
             if file_name:
-                # Обрезаем длинное имя файла для отображения
                 display_name = file_name
                 if len(file_name) > 50:
                     display_name = "..." + file_name[-47:]
 
-                progress_text = f"Обработано: {self.processed_files}/{self.total_files} файлов"
-
-                # Различаем разные типы сообщений
                 if file_name.startswith("Завершена обработка:"):
                     progress_text += f" | {file_name}"
                 elif file_name.startswith("Начат:"):
                     progress_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
+                elif file_name.startswith("Готово:"):
+                    progress_text += f" | {file_name}"
                 elif file_name == "Поиск завершен":
                     progress_text = "Поиск завершен! Обработано всех файлов."
                 else:
                     progress_text += f" | {display_name}"
 
-                self.current_file.set(progress_text)
+            self.current_file.set(progress_text)
         else:
+            status_text = f"Обработано: {self.processed_files} файлов"
+            if self.search_in_flight_count > 0:
+                status_text += f" | в работе: {self.search_in_flight_count}"
             if file_name:
-                status_text = f"Обработано: {self.processed_files} файлов"
                 if file_name.startswith("Завершена обработка:"):
                     status_text += f" | {file_name}"
                 elif file_name.startswith("Начат:"):
                     status_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
+                elif file_name.startswith("Готово:"):
+                    status_text += f" | {file_name}"
                 elif file_name == "Поиск завершен":
                     status_text = f"Поиск завершен! Обработано файлов: {self.processed_files}"
                 else:
                     status_text += f" | {file_name}"
-                self.current_file.set(status_text)
+            self.current_file.set(status_text)
 
         # Принудительно обновляем прогрессбар
         self.progress_bar.update_idletasks()
 
     def add_live_result(self, file_path, keywords):
         """Добавление найденного результата в таблицу в реальном времени."""
-        keywords_str = ', '.join(sorted(keywords)) if keywords else ''
-        self.safe_after(0, self._insert_live_result_row, keywords_str, file_path)
+        keywords_set = set(keywords) if keywords else set()
+        if file_path in self.found_results:
+            self.found_results[file_path].update(keywords_set)
+        else:
+            self.found_results[file_path] = keywords_set
+        self.dashboard_found = len(self.found_results)
+        keywords_str = ', '.join(sorted(self.found_results[file_path]))
+        self.safe_after(0, self._upsert_live_result_row, keywords_str, file_path)
+        self.safe_after(0, self.update_dashboard_labels)
+
+    def _upsert_live_result_row(self, keywords_str, file_path):
+        """Добавляет или обновляет строку результата для указанного пути."""
+        for item_id in self.results_table.get_children():
+            values = self.results_table.item(item_id, "values")
+            if len(values) >= 2 and str(values[1]) == file_path:
+                self.results_table.item(item_id, values=(keywords_str, file_path))
+                self._update_file_column_width_for_path(file_path)
+                return
+        self._insert_live_result_row(keywords_str, file_path)
 
     def _insert_live_result_row(self, keywords_str, file_path):
         """Вставляет строку результата и подстраивает ширину колонки ссылки."""
@@ -1199,9 +1315,59 @@ class SearchApp:
 
         return str(values[1]).strip()
 
+    @staticmethod
+    def split_result_path(file_path):
+        """Разделяет путь к файлу внутри архива и путь к самому архиву."""
+        if ARCHIVE_MEMBER_SEP in file_path:
+            archive_path, member_path = file_path.split(ARCHIVE_MEMBER_SEP, 1)
+            return archive_path.strip(), member_path.strip()
+        return file_path, None
+
+    def _extract_archive_member(self, archive_path, member_path):
+        """Извлекает файл из архива во временную папку и возвращает путь к копии."""
+        member_path = member_path.replace("\\", "/")
+        archive_ext = os.path.splitext(archive_path)[1].lower()
+        temp_dir = tempfile.mkdtemp(prefix="zsearch_open_")
+
+        if archive_ext == '.zip':
+            with zipfile.ZipFile(archive_path, 'r') as archive:
+                archive.extract(member_path, temp_dir)
+        elif archive_ext == '.rar':
+            import rarfile
+            with rarfile.RarFile(archive_path, 'r') as archive:
+                archive.extract(member_path, temp_dir)
+        elif archive_ext == '.7z':
+            import py7zr
+            with py7zr.SevenZipFile(archive_path, mode='r') as archive:
+                archive.extract(targets=[member_path.replace("/", os.sep)], path=temp_dir)
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise ValueError(f"Неподдерживаемый тип архива: {archive_path}")
+
+        extracted_path = os.path.normpath(os.path.join(temp_dir, member_path.replace("/", os.sep)))
+        if not os.path.isfile(extracted_path):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise FileNotFoundError(f"Файл не найден внутри архива: {member_path}")
+        return extracted_path
+
     def _open_file_by_path(self, file_path):
         """Открывает файл в системе."""
-        if not file_path or not os.path.exists(file_path):
+        if not file_path:
+            messagebox.showwarning("Файл не найден", "Путь к файлу не указан.")
+            return
+
+        archive_path, member_path = self.split_result_path(file_path)
+        if member_path:
+            if not os.path.exists(archive_path):
+                messagebox.showwarning("Файл не найден", f"Архив не существует:\n{archive_path}")
+                return
+            try:
+                extracted_path = self._extract_archive_member(archive_path, member_path)
+            except Exception as exc:
+                messagebox.showerror("Ошибка", f"Не удалось извлечь файл из архива:\n{exc}")
+                return
+            file_path = extracted_path
+        elif not os.path.exists(file_path):
             messagebox.showwarning("Файл не найден", f"Файл не существует:\n{file_path}")
             return
 
@@ -1223,16 +1389,21 @@ class SearchApp:
         """Открывает папку с файлом из выбранной строки таблицы."""
         try:
             file_path = self._get_result_file_path()
-            if not file_path or not os.path.exists(file_path):
-                messagebox.showwarning("Файл не найден", f"Файл не существует:\n{file_path}")
+            if not file_path:
+                return
+
+            archive_path, member_path = self.split_result_path(file_path)
+            target_path = archive_path if member_path else file_path
+            if not os.path.exists(target_path):
+                messagebox.showwarning("Файл не найден", f"Файл не существует:\n{target_path}")
                 return
 
             if sys.platform.startswith("win"):
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(file_path)])
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(target_path)])
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", file_path])
+                subprocess.Popen(["open", "-R", target_path])
             else:
-                subprocess.Popen(["xdg-open", os.path.dirname(file_path) or "."])
+                subprocess.Popen(["xdg-open", os.path.dirname(target_path) or "."])
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось открыть расположение файла:\n{e}")
 
@@ -1294,6 +1465,7 @@ class SearchApp:
         # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
         self.threads_var.set(str(self.get_auto_threads_count()))
         self.normalize_threads_value()
+        self.normalize_ocr_threads_value()
 
         extensions = self.get_selected_extensions()
 
@@ -1423,6 +1595,7 @@ class SearchApp:
         self.config['config']['has_7z'] = HAS_7Z
         self.config['config']['has_rar'] = HAS_RAR
         self.config['config']['has_ocr'] = HAS_OCR
+        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value()
 
         # Настраиваем логирование с защитой от дублирующихся обработчиков
         try:
@@ -1445,6 +1618,7 @@ class SearchApp:
         self.is_searching = True
         self.is_paused = False
         self.processed_files = self.resume_start_count
+        self.search_in_flight_count = 0
         if pre_count_enabled:
             self.progress_bar.config(mode="determinate")
             self.progress_value.set(0)
@@ -1597,22 +1771,22 @@ class SearchApp:
             self.is_paused = False
             self.safe_after(0, self.on_search_finished)
 
-    def update_progress_callback(self, file_name, processed_count):
+    def update_progress_callback(self, file_name, processed_count, in_flight=None):
         """Callback для обновления прогресса из search_engine"""
-        # Обновляем в основном потоке через after
-        self.safe_after(0, self._update_progress_in_main_thread, file_name, processed_count)
+        self.safe_after(0, self._update_progress_in_main_thread, file_name, processed_count, in_flight)
 
-    def _update_progress_in_main_thread(self, file_name, processed_count):
+    def _update_progress_in_main_thread(self, file_name, processed_count, in_flight=None):
         """Обновление прогресса в основном потоке"""
         if isinstance(processed_count, int):
             self.processed_files = processed_count
             self.update_dashboard_labels()
-        self.update_progress(file_name)
+        self.update_progress(file_name, in_flight=in_flight)
 
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
+        self.search_in_flight_count = 0
         self.directory_files_map = {}
         self.start_button.config(state=tk.NORMAL)
         self.pause_button.config(state=tk.DISABLED, text="Пауза")
@@ -1629,6 +1803,7 @@ class SearchApp:
 
         current_cfg = self.config['config']
         threads_count = self.normalize_threads_value()
+        ocr_threads_count = self.normalize_ocr_threads_value()
         max_size_to_save = str(self.max_size_var.get()).strip() or "0"
         max_path_to_save = str(self.max_path_length_var.get()).strip() or "0"
 
@@ -1641,6 +1816,7 @@ class SearchApp:
             'theme': self.theme_var.get(),
             'pre_count_files': 'true' if self.pre_count_files_var.get() else 'false',
             'threads': str(threads_count),
+            'ocr_threads': str(ocr_threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
             'max_file_size': max_size_to_save,

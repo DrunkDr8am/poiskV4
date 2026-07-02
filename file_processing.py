@@ -2,8 +2,10 @@ import os
 import fnmatch
 import zipfile
 import tempfile
+import threading
+import hashlib
 from io import BytesIO
-from typing import Set, Dict, List
+from typing import Set, Dict, List, Optional, Callable
 import logging
 import re
 import json
@@ -23,6 +25,7 @@ KEYWORDS_SUBSTR: Set[str] = set()
 MAX_SAFE_WINDOWS_PATH_LENGTH = 240
 MAX_SAFE_WINDOWS_NAME_LENGTH = 180
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.jpe', '.jfif', '.bmp', '.gif', '.tif', '.tiff', '.webp', '.ico')
+ARCHIVE_MEMBER_SEP = "::"
 WORD_EXTENSIONS = ('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')
 EXCEL_EXTENSIONS = ('.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm')
 PDF_SUBPROCESS_TIMEOUT_SEC = 300
@@ -32,9 +35,130 @@ WORD_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 XML_TAG_PATTERN = re.compile(rb"<[^>]+>")
 XLSX_EMPTY_ROW_STREAK_LIMIT = 200
 
+_OCR_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ocr_cache')
+_ocr_memory_cache: Dict[str, str] = {}
+_ocr_memory_cache_lock = threading.Lock()
+_OCR_MEMORY_CACHE_MAX = 256
+_ocr_semaphore: Optional[threading.Semaphore] = None
+_ocr_semaphore_limit = 0
+_ocr_semaphore_lock = threading.Lock()
 
-# Параллелизм OCR не ограничиваем до 1: пользователю важна скорость.
-OCR_CONCURRENCY_LIMIT = max(1, os.cpu_count() or 2)
+
+def _make_ocr_cache_key(*parts) -> str:
+    payload = "|".join(str(part) for part in parts)
+    return hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()
+
+
+def _ocr_disk_cache_path(cache_key: str) -> str:
+    return os.path.join(_OCR_CACHE_DIR, f"{cache_key}.txt")
+
+
+def ocr_cache_get(cache_key: str) -> Optional[str]:
+    with _ocr_memory_cache_lock:
+        if cache_key in _ocr_memory_cache:
+            return _ocr_memory_cache[cache_key]
+
+    cache_path = _ocr_disk_cache_path(cache_key)
+    if not os.path.isfile(cache_path):
+        return None
+
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as cache_file:
+            text = cache_file.read()
+    except OSError:
+        return None
+
+    with _ocr_memory_cache_lock:
+        _ocr_memory_cache[cache_key] = text
+        if len(_ocr_memory_cache) > _OCR_MEMORY_CACHE_MAX:
+            _ocr_memory_cache.pop(next(iter(_ocr_memory_cache)))
+    return text
+
+
+def ocr_cache_put(cache_key: str, text: str) -> None:
+    with _ocr_memory_cache_lock:
+        _ocr_memory_cache[cache_key] = text
+        if len(_ocr_memory_cache) > _OCR_MEMORY_CACHE_MAX:
+            _ocr_memory_cache.pop(next(iter(_ocr_memory_cache)))
+
+    try:
+        os.makedirs(_OCR_CACHE_DIR, exist_ok=True)
+        with open(_ocr_disk_cache_path(cache_key), 'w', encoding='utf-8') as cache_file:
+            cache_file.write(text)
+    except OSError as exc:
+        logging.debug(f"Не удалось сохранить OCR-кэш {cache_key}: {exc}")
+
+
+def _get_ocr_threads_limit(config: dict) -> int:
+    try:
+        limit = int(config.get('ocr_threads', 2) or 2)
+    except (TypeError, ValueError):
+        limit = 2
+    return max(1, limit)
+
+
+def _get_ocr_semaphore(config: dict) -> threading.Semaphore:
+    global _ocr_semaphore, _ocr_semaphore_limit
+    limit = _get_ocr_threads_limit(config)
+    with _ocr_semaphore_lock:
+        if _ocr_semaphore is None or _ocr_semaphore_limit != limit:
+            _ocr_semaphore = threading.Semaphore(limit)
+            _ocr_semaphore_limit = limit
+        return _ocr_semaphore
+
+
+def _execute_ocr(cache_key: str, config: dict, ocr_runner: Callable[[], str]) -> str:
+    cached_text = ocr_cache_get(cache_key)
+    if cached_text is not None:
+        return cached_text
+
+    semaphore = _get_ocr_semaphore(config)
+    with semaphore:
+        cached_text = ocr_cache_get(cache_key)
+        if cached_text is not None:
+            return cached_text
+        text = ocr_runner()
+
+    ocr_cache_put(cache_key, text)
+    return text
+
+
+def _file_ocr_cache_key(file_path: str, config: dict) -> str:
+    stat = os.stat(file_path)
+    return _make_ocr_cache_key(
+        os.path.abspath(file_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        config.get('tesseract_languages', 'rus'),
+        config.get('tesseract_config', '--oem 3 --psm 6'),
+    )
+
+
+def _pil_image_cache_key(pil_img, config: dict, preprocess: bool) -> str:
+    buffer = BytesIO()
+    pil_img.save(buffer, format='PNG')
+    return _make_ocr_cache_key(
+        buffer.getvalue(),
+        config.get('tesseract_languages', 'rus'),
+        config.get('tesseract_config', '--oem 3 --psm 6'),
+        preprocess,
+    )
+
+
+def _pdf_page_cache_key(pdf_path: str, page_index: int, xref: Optional[int], config: dict, mode: str, preprocess: bool) -> str:
+    stat = os.stat(pdf_path)
+    return _make_ocr_cache_key(
+        os.path.abspath(pdf_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        page_index,
+        xref if xref is not None else mode,
+        mode,
+        config.get('tesseract_languages', 'rus'),
+        config.get('tesseract_config', '--oem 3 --psm 6'),
+        preprocess,
+        PDF_OCR_RENDER_ZOOM,
+    )
 
 
 def _extract_json_from_stdout(stdout_text: str) -> Dict:
@@ -101,6 +225,23 @@ def _ocr_pil_image(pil_img, pytesseract, ocr_lang: str, ocr_cfg: str, preprocess
     )
 
 
+def _ocr_pil_image_cached(
+    pil_img,
+    pytesseract,
+    config: dict,
+    preprocess: bool = True,
+    cache_key: Optional[str] = None,
+) -> str:
+    ocr_lang = config.get('tesseract_languages', 'rus')
+    ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
+    resolved_cache_key = cache_key or _pil_image_cache_key(pil_img, config, preprocess)
+
+    def run_ocr() -> str:
+        return _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg, preprocess)
+
+    return _execute_ocr(resolved_cache_key, config, run_ocr)
+
+
 def _extract_embedded_pdf_image(doc, xref: int, Image):
     """Извлекает встроенное изображение PDF с учётом smask (маски прозрачности)."""
     base_image = doc.extract_image(xref)
@@ -122,39 +263,51 @@ def _extract_embedded_pdf_image(doc, xref: int, Image):
     return background
 
 
-def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, ocr_lang: str, ocr_cfg: str) -> str:
+def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config: dict, pdf_path: str, page_index: int) -> str:
     """OCR всей страницы PDF как растрового изображения."""
-    try:
-        zoom = PDF_OCR_RENDER_ZOOM
-        matrix = fitz_module.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        if pix.width <= 0 or pix.height <= 0:
+    cache_key = _pdf_page_cache_key(pdf_path, page_index, None, config, 'pixmap', True)
+
+    def run_ocr() -> str:
+        try:
+            zoom = PDF_OCR_RENDER_ZOOM
+            matrix = fitz_module.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            if pix.width <= 0 or pix.height <= 0:
+                return ""
+            pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            return _ocr_pil_image(
+                pil_img,
+                pytesseract,
+                config.get('tesseract_languages', 'rus'),
+                config.get('tesseract_config', '--oem 3 --psm 6'),
+                True,
+            )
+        except Exception:
             return ""
-        pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        return _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg)
-    except Exception:
-        return ""
+
+    return _execute_ocr(cache_key, config, run_ocr)
 
 
-def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, ocr_lang: str, ocr_cfg: str) -> str:
-    """OCR страницы-скана: растеризация страницы + встроенные изображения."""
+def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, config: dict, pdf_path: str, page_index: int) -> str:
+    """OCR страницы-скана: сначала встроенные изображения, иначе растеризация страницы."""
     ocr_chunks = []
-    page_text = _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, ocr_lang, ocr_cfg)
-    if page_text:
-        ocr_chunks.append(page_text)
-
     for img in page.get_images(full=True):
         try:
-            pil_img = _extract_embedded_pdf_image(doc, img[0], Image)
+            xref = img[0]
+            pil_img = _extract_embedded_pdf_image(doc, xref, Image)
             if pil_img is None:
                 continue
-            embedded_text = _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg)
+            cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', True)
+            embedded_text = _ocr_pil_image_cached(pil_img, pytesseract, config, True, cache_key)
             if embedded_text:
                 ocr_chunks.append(embedded_text)
         except Exception:
             continue
 
-    return "\n".join(ocr_chunks)
+    if ocr_chunks:
+        return "\n".join(ocr_chunks)
+
+    return _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config, pdf_path, page_index)
 
 
 def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], keywords_substr: Set[str],
@@ -166,8 +319,6 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
     with fitz.open(pdf_path) as doc:
         max_pages = int(config.get('max_pdf_pages', 0) or 0)
         has_ocr = bool(config.get('has_ocr', False))
-        ocr_lang = config.get('tesseract_languages', 'rus')
-        ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
         ocr_ready = False
         pytesseract = None
         Image = None
@@ -195,20 +346,20 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
 
             page_text_empty = not (text or "").strip()
             if page_text_empty:
-                # Скан / «картиночный» PDF: OCR страницы и встроенных изображений (с маской smask).
                 ocr_text = _ocr_pdf_scanned_page(
-                    page, doc, fitz, pytesseract, Image, ocr_lang, PDF_OCR_TESSERACT_CONFIG
+                    page, doc, fitz, pytesseract, Image, config, pdf_path, page_index
                 )
                 found.update(_search_in_ocr_text(ocr_text, keywords_words, keywords_substr))
             else:
-                # PDF с текстовым слоем: дополнительно проверяем встроенные изображения.
                 for img in page.get_images(full=True):
                     try:
-                        pil_img = _extract_embedded_pdf_image(doc, img[0], Image)
+                        xref = img[0]
+                        pil_img = _extract_embedded_pdf_image(doc, xref, Image)
                         if pil_img is None:
                             continue
-                        ocr_text = _ocr_pil_image(
-                            pil_img, pytesseract, ocr_lang, ocr_cfg, preprocess=False
+                        cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', False)
+                        ocr_text = _ocr_pil_image_cached(
+                            pil_img, pytesseract, config, False, cache_key
                         )
                         found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
                         if keywords_all and found.issuperset(keywords_all):
@@ -596,7 +747,6 @@ def extract_best_effort_text(file_path: str) -> str:
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
     """Распознавание текста с изображения"""
-    # Проверяем доступность OCR через конфиг
     if not config.get('has_ocr', False):
         return set()
 
@@ -608,10 +758,15 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         return set()
 
     try:
-        img = Image.open(image_data) if isinstance(image_data, BytesIO) else Image.open(image_data)
+        if isinstance(image_data, BytesIO):
+            img = Image.open(image_data)
+            cache_key = _pil_image_cache_key(img, config, False)
+        else:
+            if not os.path.isfile(image_data):
+                return set()
+            cache_key = _file_ocr_cache_key(image_data, config)
+            img = Image.open(image_data)
 
-        # Для палитровых изображений с прозрачностью сначала переводим в RGBA,
-        # чтобы избежать предупреждения Pillow и корректно обработать альфа-канал.
         if img.mode == 'P' and 'transparency' in img.info:
             img = img.convert('RGBA')
 
@@ -620,11 +775,7 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         elif img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
 
-        # Используем настройки из конфига
-        languages = config.get('tesseract_languages', 'rus')
-        config_param = config.get('tesseract_config', '--oem 3 --psm 6')
-
-        text = pytesseract.image_to_string(img, lang=languages, config=config_param)
+        text = _ocr_pil_image_cached(img, pytesseract, config, False, cache_key)
         return search_in_text(text)
     except Exception as e:
         logging.error(f"Ошибка обработки изображения {image_data}: {e}")
@@ -662,6 +813,7 @@ def _search_in_pdf_inprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+        "ocr_threads": _get_ocr_threads_limit(config),
     }
     _ensure_tesseract_for_pdf(payload_config)
     try:
@@ -684,6 +836,7 @@ def _search_in_pdf_subprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+        "ocr_threads": _get_ocr_threads_limit(config),
     }
 
     worker_args = [
@@ -857,26 +1010,108 @@ def search_in_excel(excel_path: str, config: dict) -> Set[str]:
 
     return found
 
-def search_in_archive(archive_path: str, extensions: List[str], config: dict) -> Set[str]:
-    """Обработка архивов с поддержкой изображений"""
-    found = set()
+def format_archive_member_path(archive_path: str, member_path: str) -> str:
+    """Полный отображаемый путь: архив + файл внутри архива."""
+    normalized_member = member_path.replace("\\", "/")
+    return f"{archive_path}{ARCHIVE_MEMBER_SEP}{normalized_member}"
+
+
+def _record_archive_hits(results: Dict[str, Set[str]], archive_path: str, member_path: str, keywords: Set[str]) -> None:
+    if keywords:
+        display_path = format_archive_member_path(archive_path, member_path)
+        results.setdefault(display_path, set()).update(keywords)
+
+
+def _archive_member_matches(member_name: str, extensions: List[str]) -> bool:
+    normalized = member_name.replace("\\", "/").rstrip("/")
+    if not normalized or normalized.endswith("/"):
+        return False
+    return any(fnmatch.fnmatch(normalized, ext) for ext in extensions)
+
+
+def _process_extracted_archive_member(
+    results: Dict[str, Set[str]],
+    archive_path: str,
+    member_path: str,
+    extracted_file: str,
+    config: dict,
+) -> None:
+    member_lower = member_path.lower()
+    if member_lower.endswith(IMAGE_EXTENSIONS) and config.get('has_ocr', False):
+        _record_archive_hits(results, archive_path, member_path, search_in_image(extracted_file, config))
+    elif member_lower.endswith('.pdf') and config.get('has_pdf', False):
+        _record_archive_hits(results, archive_path, member_path, search_in_pdf(extracted_file, config))
+    elif member_lower.endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
+        _record_archive_hits(results, archive_path, member_path, search_in_docx(extracted_file, config))
+    elif member_lower.endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
+        _record_archive_hits(results, archive_path, member_path, search_in_excel(extracted_file, config))
+
+
+def _read_7z_member_text(archive, member_name: str) -> str:
+    normalized_name = member_name.replace("\\", "/")
+    payload = archive.read([normalized_name])
+    if not payload:
+        return ""
+    member_stream = payload.get(normalized_name) or payload.get(member_name)
+    if member_stream is None:
+        return ""
+    raw_data = member_stream.read()
+    if isinstance(raw_data, str):
+        return raw_data
+    return raw_data.decode('utf-8', errors='ignore')
+
+
+def _process_7z_member(
+    archive,
+    archive_path: str,
+    member_name: str,
+    extensions: List[str],
+    config: dict,
+    temp_dir: str,
+    results: Dict[str, Set[str]],
+) -> None:
+    normalized_name = member_name.replace("\\", "/")
+    if not _archive_member_matches(normalized_name, extensions):
+        return
+
+    member_lower = normalized_name.lower()
+    if member_lower.endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
+        try:
+            content = _read_7z_member_text(archive, normalized_name)
+            _record_archive_hits(results, archive_path, normalized_name, search_in_text(content))
+        except Exception as exc:
+            logging.warning(f"Не удалось прочитать {normalized_name} внутри 7Z {archive_path}: {exc}")
+        return
+
+    try:
+        archive.extract(targets=[normalized_name], path=temp_dir)
+    except Exception as exc:
+        logging.warning(f"Не удалось извлечь {normalized_name} из 7Z {archive_path}: {exc}")
+        return
+
+    extracted_file = os.path.normpath(os.path.join(temp_dir, normalized_name.replace("/", os.sep)))
+    if os.path.isfile(extracted_file):
+        _process_extracted_archive_member(results, archive_path, normalized_name, extracted_file, config)
+
+
+def search_in_archive(archive_path: str, extensions: List[str], config: dict) -> Dict[str, Set[str]]:
+    """Обработка архивов с поддержкой изображений."""
+    results: Dict[str, Set[str]] = {}
     try:
         if archive_path.endswith('.zip'):
             with zipfile.ZipFile(archive_path, 'r') as z:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     for file in z.namelist():
                         if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                            # Для текстовых файлов читаем напрямую
                             if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
                                 try:
                                     with z.open(file) as f:
                                         content = f.read().decode('utf-8', errors='ignore')
-                                        found.update(search_in_text(content))
+                                    _record_archive_hits(results, archive_path, file, search_in_text(content))
                                 except Exception as e:
                                     logging.warning(f"Не удалось открыть файл {file} внутри ZIP {archive_path}: {e}")
                                     continue
                             else:
-                                # Извлекаем файл во временную директорию один раз
                                 try:
                                     z.extract(file, temp_dir)
                                 except Exception as e:
@@ -884,59 +1119,26 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                     continue
                                 extracted_file = os.path.join(temp_dir, file)
                                 if os.path.isfile(extracted_file):
-                                    # Обрабатываем изображения (только если OCR доступен)
-                                    if file.lower().endswith(IMAGE_EXTENSIONS) and config.get(
-                                        'has_ocr', False):
-                                        found.update(search_in_image(extracted_file, config))
-                                    # Обрабатываем PDF
-                                    elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
-                                        found.update(search_in_pdf(extracted_file, config))
-                                    # Обрабатываем DOCX
-                                    elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
-                                        found.update(search_in_docx(extracted_file, config))
-                                    # Обрабатываем Excel
-                                    elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
-                                        found.update(search_in_excel(extracted_file, config))
-
+                                    _process_extracted_archive_member(results, archive_path, file, extracted_file, config)
 
         elif archive_path.endswith('.7z'):
             try:
                 import py7zr
             except ImportError:
-                return set()
+                return results
             with tempfile.TemporaryDirectory() as temp_dir:
                 try:
-                    with py7zr.SevenZipFile(archive_path, mode='r') as z:
-                        # Извлекаем все файлы
-                        z.extractall(path=temp_dir)
-                    # Рекурсивно обходим извлеченные файлы
-                    for root, dirs, files in os.walk(temp_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            relative_path = os.path.relpath(file_path, temp_dir)
-                            if any(fnmatch.fnmatch(relative_path, ext) for ext in extensions):
-                                # Обрабатываем файлы в зависимости от типа
-                                if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
-                                    try:
-                                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                            content = f.read()
-                                            found.update(search_in_text(content))
-                                    except:
-                                        try:
-                                            with open(file_path, 'rb') as f:
-                                                content = f.read().decode('utf-8', errors='ignore')
-                                                found.update(search_in_text(content))
-                                        except:
-                                            pass
-                                elif file.lower().endswith(IMAGE_EXTENSIONS) and config.get('has_ocr',
-                                                                                                          False):
-                                    found.update(search_in_image(file_path, config))
-                                elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
-                                    found.update(search_in_pdf(file_path, config))
-                                elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
-                                    found.update(search_in_docx(file_path, config))
-                                elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
-                                    found.update(search_in_excel(file_path, config))
+                    with py7zr.SevenZipFile(archive_path, mode='r') as archive:
+                        for member_name in archive.getnames():
+                            _process_7z_member(
+                                archive,
+                                archive_path,
+                                member_name,
+                                extensions,
+                                config,
+                                temp_dir,
+                                results,
+                            )
                 except Exception as e:
                     logging.error(f"Ошибка обработки 7z архива {archive_path}: {e}")
 
@@ -944,23 +1146,21 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
             try:
                 import rarfile
             except ImportError:
-                return set()
+                return results
 
             with rarfile.RarFile(archive_path, 'r') as z:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     for file in z.namelist():
                         if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                            # Для текстовых файлов читаем напрямую
                             if file.lower().endswith(('.txt', '.csv', '.log', '.xml', '.html', '.htm')):
                                 try:
                                     with z.open(file) as f:
                                         content = f.read().decode('utf-8', errors='ignore')
-                                        found.update(search_in_text(content))
+                                    _record_archive_hits(results, archive_path, file, search_in_text(content))
                                 except Exception as e:
                                     logging.warning(f"Не удалось открыть файл {file} внутри RAR {archive_path}: {e}")
                                     continue
                             else:
-                                # Извлекаем файл во временную директорию один раз
                                 try:
                                     z.extract(file, temp_dir)
                                 except Exception as e:
@@ -968,23 +1168,11 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                     continue
                                 extracted_file = os.path.join(temp_dir, file)
                                 if os.path.isfile(extracted_file):
-                                    # Обрабатываем изображения (только если OCR доступен)
-                                    if file.lower().endswith(IMAGE_EXTENSIONS) and config.get(
-                                        'has_ocr', False):
-                                        found.update(search_in_image(extracted_file, config))
-                                    # Обрабатываем PDF
-                                    elif file.lower().endswith('.pdf') and config.get('has_pdf', False):
-                                        found.update(search_in_pdf(extracted_file, config))
-                                    # Обрабатываем DOCX
-                                    elif file.lower().endswith(WORD_EXTENSIONS) and config.get('has_docx', False):
-                                        found.update(search_in_docx(extracted_file, config))
-                                    # Обрабатываем Excel
-                                    elif file.lower().endswith(EXCEL_EXTENSIONS) and config.get('has_excel', False):
-                                        found.update(search_in_excel(extracted_file, config))
+                                    _process_extracted_archive_member(results, archive_path, file, extracted_file, config)
 
     except Exception as e:
         logging.error(f"Ошибка обработки архива {archive_path}: {e}")
-    return found
+    return results
 
 
 def process_file_with_meta(file_path: str, extensions: List[str], max_file_size: int, config: dict):
@@ -1044,7 +1232,10 @@ def process_file_with_meta(file_path: str, extensions: List[str], max_file_size:
             if ext == '.rar' and not config.get('has_rar', False):
                 logging.info(f"Пропуск RAR {file_path} (обработка RAR недоступна)")
                 return {}, "skipped", "", "module_unavailable"
-            found = search_in_archive(file_path, extensions, config)
+            archive_results = search_in_archive(file_path, extensions, config)
+            if archive_results:
+                return archive_results, "matched", "", ""
+            return {}, status, "", ""
         else:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:

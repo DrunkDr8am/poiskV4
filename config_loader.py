@@ -36,6 +36,7 @@ def load_config(config_file="config.txt"):
         'theme': 'Светлая',
         'pre_count_files': 'true',
         'threads': '4',
+        'ocr_threads': '2',
         'output_file': 'search_results.txt',
         'search_images': 'false',
         'max_file_size': '50',
@@ -68,6 +69,7 @@ def load_config(config_file="config.txt"):
     theme = config.get('Settings', 'theme', fallback=defaults['theme'])
     pre_count_files = config.getboolean('Settings', 'pre_count_files', fallback=True)
     threads = _safe_getint(config, 'Settings', 'threads', int(defaults['threads']))
+    ocr_threads = _safe_getint(config, 'Settings', 'ocr_threads', int(defaults['ocr_threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
     max_file_size = _safe_getint(config, 'Settings', 'max_file_size', int(defaults['max_file_size']))
@@ -102,6 +104,7 @@ def load_config(config_file="config.txt"):
         'theme': theme,
         'pre_count_files': pre_count_files,
         'threads': threads,
+        'ocr_threads': ocr_threads,
         'output_file': output_file,
         'search_images': search_images,
         'max_file_size': max_file_size,
@@ -135,6 +138,9 @@ pre_count_files = true
 
 # Количество потоков для обработки
 threads = 4
+
+# Количество параллельных OCR-потоков (Tesseract)
+ocr_threads = 2
 
 # Файл для сохранения результатов
 output_file = search_results.txt

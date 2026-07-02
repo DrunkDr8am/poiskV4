@@ -7,3 +7,4 @@
 /dist/
 /.venv/
 /tesseract/
+/.ocr_cache/
