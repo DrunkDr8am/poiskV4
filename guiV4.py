@@ -549,7 +549,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.6 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.7 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -1598,25 +1598,19 @@ class SearchApp:
             messagebox.showerror("Ошибка", "Макс. размер файла не может быть отрицательным.")
             return
 
-        # В зависимости от режима либо считаем файлы заранее, либо запускаем сразу.
+        # Сначала проверяем, можно ли возобновить прошлую сессию — до долгого подсчёта файлов.
         pre_count_enabled = bool(self.pre_count_files_var.get())
-        calculated_total = 0
-        self.directory_files_map = {}
-        if pre_count_enabled:
-            for directory in self.directories_list:
-                files_in_directory = self.collect_files_to_process(directory, extensions)
-                self.directory_files_map[directory] = files_in_directory
-                calculated_total += len(files_in_directory)
-
         signature = self.build_search_signature(extensions, keywords, max_file_size)
         resume_state = None
         self.resume_processed_files = set()
         self.resume_start_count = 0
-        self.total_files = calculated_total if pre_count_enabled else 0
+        self.total_files = 0
         resume_matched_count = 0
         resume_skipped_count = 0
         resume_error_count = 0
         resume_skip_reasons = {}
+        calculated_total = 0
+        self.directory_files_map = {}
 
         previous_state = self.load_search_state(include_processed_paths=False)
         if (
@@ -1625,7 +1619,7 @@ class SearchApp:
             and previous_state.get("signature") == signature
         ):
             previous_processed_count = int(previous_state.get("processed_count", 0))
-            previous_total = max(int(previous_state.get("total_files", 0)), calculated_total)
+            previous_total = int(previous_state.get("total_files", 0))
             remaining = max(0, previous_total - previous_processed_count)
             resume_choice = messagebox.askyesnocancel(
                 "Найден незавершенный поиск",
@@ -1655,7 +1649,15 @@ class SearchApp:
                     f"осталось {max(0, self.total_files - self.resume_start_count)}"
                 )
 
-        if pre_count_enabled and self.total_files == 0:
+        # Подсчёт файлов только для нового поиска (не при возобновлении).
+        if resume_state is None and pre_count_enabled:
+            for directory in self.directories_list:
+                files_in_directory = self.collect_files_to_process(directory, extensions)
+                self.directory_files_map[directory] = files_in_directory
+                calculated_total += len(files_in_directory)
+            self.total_files = calculated_total
+
+        if resume_state is None and pre_count_enabled and self.total_files == 0:
             messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
             return
 
