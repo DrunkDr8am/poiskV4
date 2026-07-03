@@ -17,10 +17,10 @@ except ImportError:  # pragma: no cover - крайне редкий случай
 from config_loader import load_config, create_default_config
 from tesseract_setup import setup_tesseract
 from file_processing import load_keywords, run_pdf_worker_cli, ARCHIVE_MEMBER_SEP
-from search_engine import search_files
+from search_engine import search_files, collect_matching_files, PRECOUNT_PROGRESS_INTERVAL
 from configparser import ConfigParser
 
-import fnmatch
+
 import zipfile
 import tempfile
 import shutil
@@ -75,6 +75,9 @@ class SearchApp:
         self.is_searching = False
         self.is_paused = False
         self.search_thread = None
+        self.precount_thread = None
+        self.is_precounting = False
+        self.precount_cancel_requested = False
         self.directory_add_thread = None
         self.is_adding_directory = False
         self.is_closing = False
@@ -132,7 +135,10 @@ class SearchApp:
         # Создаем интерфейс
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.init_search_state_storage()
+        try:
+            self.init_search_state_storage()
+        except Exception as exc:
+            logging.error(f"Не удалось инициализировать хранилище состояния поиска: {exc}")
         self.found_results = self._load_found_results_from_db()
         self.dashboard_found = len(self.found_results)
         self.refresh_search_session_ui()
@@ -549,7 +555,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.7 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.8 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -685,36 +691,41 @@ class SearchApp:
     def init_search_state_storage(self):
         """Инициализирует хранилище состояния поиска (SQLite-only)."""
         if sqlite3 is None:
-            raise RuntimeError("Модуль sqlite3 недоступен в текущей среде Python")
+            logging.warning("Модуль sqlite3 недоступен: сохранение состояния поиска отключено")
+            return
         self._init_search_state_db()
 
     def _init_search_state_db(self):
         """Создает SQLite-таблицы для состояния поиска."""
-        with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS state_kv (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+        try:
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS state_kv (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS processed_files (
-                    path TEXT PRIMARY KEY
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS processed_files (
+                        path TEXT PRIMARY KEY
+                    )
+                    """
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS search_results (
-                    path TEXT PRIMARY KEY,
-                    keywords TEXT NOT NULL
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS search_results (
+                        path TEXT PRIMARY KEY,
+                        keywords TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            conn.commit()
+                conn.commit()
+        except Exception as exc:
+            logging.error(f"Не удалось инициализировать {SEARCH_STATE_DB_FILE}: {exc}")
+            raise
 
     def _load_found_results_from_db(self):
         """Загружает сохранённые совпадения из SQLite."""
@@ -1292,6 +1303,8 @@ class SearchApp:
                     progress_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
                 elif file_name.startswith("Подготовка:"):
                     progress_text += f" | {file_name}"
+                elif file_name.startswith("Подсчёт файлов:"):
+                    progress_text = file_name
                 elif file_name.startswith("Запуск поиска:"):
                     progress_text += f" | {file_name}"
                 elif file_name.startswith("Готово:"):
@@ -1532,16 +1545,229 @@ class SearchApp:
             self.results_table.item(self.hovered_result_item, tags=())
             self.hovered_result_item = None
 
-    def collect_files_to_process(self, directory, extensions):
-        """Собирает список файлов для обработки в директории."""
-        collected = []
-        for root, _, files in os.walk(directory):
-            for file in files:
-                file_path = os.path.join(root, file)
-                # Используем fnmatch для проверки соответствия расширениям
-                if any(fnmatch.fnmatch(file, ext) for ext in extensions):
-                    collected.append(file_path)
-        return collected
+    def collect_files_to_process(self, directory, extensions, progress_callback=None, cancel_check=None):
+        """Собирает список файлов для обработки в директории (scandir + суффиксы)."""
+        return collect_matching_files(
+            directory,
+            extensions,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _update_precount_progress(self, matched_count):
+        """Обновляет статус фонового подсчёта файлов."""
+        self.current_file.set(f"Подсчёт файлов: найдено {matched_count}...")
+
+    def _reset_precount_ui(self):
+        """Возвращает интерфейс в режим ожидания после отмены подсчёта."""
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="determinate")
+        self.progress_value.set(0)
+        if not self.is_searching:
+            self.start_button.config(state=tk.NORMAL)
+        self.current_file.set("")
+
+    def _start_background_precount(self, extensions, signature, max_file_size):
+        """Запускает подсчёт файлов в фоне, затем стартует поиск."""
+        self.is_precounting = True
+        self.precount_cancel_requested = False
+        self.directory_files_map = {}
+        self.total_files = 0
+        self.start_button.config(state=tk.DISABLED)
+        self.pause_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start(10)
+        self.current_file.set("Подсчёт файлов: подготовка...")
+
+        def precount_worker():
+            files_map = {}
+            calculated_total = 0
+            last_reported = 0
+            try:
+                def report_progress(count):
+                    nonlocal last_reported
+                    if count - last_reported >= 1000 or count <= PRECOUNT_PROGRESS_INTERVAL:
+                        last_reported = count
+                        self.safe_after(0, self._update_precount_progress, count)
+
+                def cancel_check():
+                    return self.precount_cancel_requested or self.is_closing
+
+                for directory in self.directories_list:
+                    if cancel_check():
+                        self.safe_after(0, self._on_precount_cancelled)
+                        return
+                    files_in_directory = self.collect_files_to_process(
+                        directory,
+                        extensions,
+                        progress_callback=report_progress,
+                        cancel_check=cancel_check,
+                    )
+                    if cancel_check():
+                        self.safe_after(0, self._on_precount_cancelled)
+                        return
+                    files_map[directory] = files_in_directory
+                    calculated_total += len(files_in_directory)
+
+                self.safe_after(
+                    0,
+                    self._on_precount_finished,
+                    None,
+                    files_map,
+                    calculated_total,
+                    extensions,
+                    signature,
+                    max_file_size,
+                )
+            except Exception as exc:
+                self.safe_after(
+                    0,
+                    self._on_precount_finished,
+                    exc,
+                    {},
+                    0,
+                    extensions,
+                    signature,
+                    max_file_size,
+                )
+
+        self.precount_thread = threading.Thread(
+            target=precount_worker,
+            name="precount-worker",
+            daemon=True,
+        )
+        self.precount_thread.start()
+
+    def _on_precount_cancelled(self):
+        """Отмена фонового подсчёта (закрытие окна или отмена пользователем)."""
+        self.is_precounting = False
+        self.precount_thread = None
+        self._reset_precount_ui()
+
+    def _on_precount_finished(self, error, files_map, calculated_total, extensions, signature, max_file_size):
+        """Завершает фоновый подсчёт и запускает поиск или показывает ошибку."""
+        self.is_precounting = False
+        self.precount_thread = None
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="determinate")
+
+        if self.precount_cancel_requested or self.is_closing:
+            self._reset_precount_ui()
+            return
+
+        if error is not None:
+            self.report_runtime_error("Ошибка подсчёта файлов", error, show_dialog=True)
+            self._reset_precount_ui()
+            return
+
+        self.directory_files_map = files_map
+        self.total_files = calculated_total
+        if self.total_files == 0:
+            messagebox.showwarning(
+                "Предупреждение",
+                "Не найдено файлов для обработки в указанных директориях!",
+                parent=self.root,
+            )
+            self._reset_precount_ui()
+            return
+
+        logging.info(f"Подсчёт файлов завершён: {self.total_files}")
+        self._launch_search(
+            extensions=extensions,
+            signature=signature,
+            max_file_size=max_file_size,
+            resume_state=None,
+            resume_skipped_count=0,
+            resume_error_count=0,
+            resume_skip_reasons={},
+            pre_count_enabled=True,
+        )
+
+    def _launch_search(
+        self,
+        extensions,
+        signature,
+        max_file_size,
+        resume_state,
+        resume_skipped_count,
+        resume_error_count,
+        resume_skip_reasons,
+        pre_count_enabled,
+    ):
+        """Общая логика запуска поиска после валидации и (опционально) подсчёта файлов."""
+        self.clear_all()
+
+        self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        start_message = f"Поиск начат: {self.search_start_time}"
+        logging.info(start_message)
+        self.prepare_search_state(signature, self.total_files, resume_state=resume_state)
+        self.reset_dashboard(
+            self.total_files,
+            self.resume_start_count,
+            len(self.found_results),
+            resume_skipped_count,
+            resume_error_count,
+        )
+        if resume_skip_reasons:
+            for reason_key in self.dashboard_skip_reasons:
+                self.dashboard_skip_reasons[reason_key] = int(resume_skip_reasons.get(reason_key, 0))
+
+        self.update_config()
+
+        self.config['config']['has_pdf'] = HAS_PDF
+        self.config['config']['has_docx'] = HAS_DOCX
+        self.config['config']['has_excel'] = HAS_EXCEL
+        self.config['config']['has_7z'] = HAS_7Z
+        self.config['config']['has_rar'] = HAS_RAR
+        self.config['config']['has_ocr'] = HAS_OCR
+        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value()
+
+        try:
+            self.ensure_search_file_logging('search_log.txt')
+        except Exception as e:
+            logging.error(f"Не удалось настроить файловое логирование: {e}")
+
+        try:
+            load_keywords("keywords.txt")
+        except ValueError as e:
+            self.finalize_search_state("stopped", str(e))
+            messagebox.showerror("Ошибка", str(e), parent=self.root)
+            self._reset_precount_ui()
+            return
+
+        self.start_button.config(state=tk.DISABLED)
+        self.pause_button.config(state=tk.NORMAL, text="Пауза")
+        self.stop_button.config(state=tk.NORMAL)
+        self.is_searching = True
+        self.is_paused = False
+        self.processed_files = self.resume_start_count
+        self.search_in_flight_count = 0
+
+        use_determinate_progress = bool(
+            pre_count_enabled or (resume_state is not None and self.total_files > 0)
+        )
+        if use_determinate_progress:
+            self.progress_bar.config(mode="determinate")
+            if self.total_files > 0:
+                self.progress_value.set((self.resume_start_count / self.total_files) * 100)
+            else:
+                self.progress_value.set(0)
+        else:
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            self.current_file.set(
+                f"Обработано: {self.processed_files} файлов | Поиск запущен без предварительного подсчета"
+            )
+
+        self.search_thread = threading.Thread(
+            target=self.run_search,
+            args=(extensions, self.update_progress_callback),
+            name="search-worker",
+        )
+        self.search_thread.daemon = True
+        self._begin_search_preparation_ui()
+        self.search_thread.start()
 
     def get_selected_extensions(self):
         """Возвращает список расширений, выбранных галочками."""
@@ -1549,7 +1775,7 @@ class SearchApp:
 
     def start_search(self):
         """Запуск поиска в отдельном потоке"""
-        if self.is_searching:
+        if self.is_searching or self.is_precounting:
             return
         if self.is_adding_directory:
             messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
@@ -1605,11 +1831,9 @@ class SearchApp:
         self.resume_processed_files = set()
         self.resume_start_count = 0
         self.total_files = 0
-        resume_matched_count = 0
         resume_skipped_count = 0
         resume_error_count = 0
         resume_skip_reasons = {}
-        calculated_total = 0
         self.directory_files_map = {}
 
         previous_state = self.load_search_state(include_processed_paths=False)
@@ -1639,7 +1863,6 @@ class SearchApp:
                 self.resume_paths_pending_load = True
                 self.resume_start_count = previous_processed_count
                 self.total_files = previous_total
-                resume_matched_count = int(previous_state.get("matched_count", 0))
                 resume_skipped_count = int(previous_state.get("skipped_count", 0))
                 resume_error_count = int(previous_state.get("error_count", 0))
                 if isinstance(previous_state.get("skip_reasons"), dict):
@@ -1650,87 +1873,37 @@ class SearchApp:
                 )
 
         # Подсчёт файлов только для нового поиска (не при возобновлении).
-        if resume_state is None and pre_count_enabled:
-            for directory in self.directories_list:
-                files_in_directory = self.collect_files_to_process(directory, extensions)
-                self.directory_files_map[directory] = files_in_directory
-                calculated_total += len(files_in_directory)
-            self.total_files = calculated_total
-
-        if resume_state is None and pre_count_enabled and self.total_files == 0:
-            messagebox.showwarning("Предупреждение", "Не найдено файлов для обработки в указанных директориях!")
+        if resume_state is not None:
+            logging.info(
+                f"Возобновление без пересчёта файлов: всего {self.total_files}, "
+                f"уже обработано {self.resume_start_count}"
+            )
+            self._launch_search(
+                extensions=extensions,
+                signature=signature,
+                max_file_size=max_file_size,
+                resume_state=resume_state,
+                resume_skipped_count=resume_skipped_count,
+                resume_error_count=resume_error_count,
+                resume_skip_reasons=resume_skip_reasons,
+                pre_count_enabled=pre_count_enabled,
+            )
             return
 
-        # Очищаем результаты и лог
-        self.clear_all()
-
-        # Записываем время начала поиска
-        self.search_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        start_message = f"Поиск начат: {self.search_start_time}"
-        logging.info(start_message)
-        self.prepare_search_state(signature, self.total_files, resume_state=resume_state)
-        self.reset_dashboard(
-            self.total_files,
-            self.resume_start_count,
-            len(self.found_results),
-            resume_skipped_count,
-            resume_error_count,
-        )
-        if resume_skip_reasons:
-            for reason_key in self.dashboard_skip_reasons:
-                self.dashboard_skip_reasons[reason_key] = int(resume_skip_reasons.get(reason_key, 0))
-
-        # Обновляем конфиг
-        self.update_config()
-
-        # Добавляем информацию о доступности модулей в конфиг
-        self.config['config']['has_pdf'] = HAS_PDF
-        self.config['config']['has_docx'] = HAS_DOCX
-        self.config['config']['has_excel'] = HAS_EXCEL
-        self.config['config']['has_7z'] = HAS_7Z
-        self.config['config']['has_rar'] = HAS_RAR
-        self.config['config']['has_ocr'] = HAS_OCR
-        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value()
-
-        # Настраиваем логирование с защитой от дублирующихся обработчиков
-        try:
-            self.ensure_search_file_logging('search_log.txt')
-        except Exception as e:
-            logging.error(f"Не удалось настроить файловое логирование: {e}")
-
-        # Загружаем ключевые слова
-        try:
-            load_keywords("keywords.txt")
-        except ValueError as e:
-            self.finalize_search_state("stopped", str(e))
-            messagebox.showerror("Ошибка", str(e))
-            return
-
-        # Меняем состояние кнопок
-        self.start_button.config(state=tk.DISABLED)
-        self.pause_button.config(state=tk.NORMAL, text="Пауза")
-        self.stop_button.config(state=tk.NORMAL)
-        self.is_searching = True
-        self.is_paused = False
-        self.processed_files = self.resume_start_count
-        self.search_in_flight_count = 0
         if pre_count_enabled:
-            self.progress_bar.config(mode="determinate")
-            self.progress_value.set(0)
-        else:
-            self.progress_bar.config(mode="indeterminate")
-            self.progress_bar.start(10)
-            self.current_file.set(f"Обработано: {self.processed_files} файлов | Поиск запущен без предварительного подсчета")
+            self._start_background_precount(extensions, signature, max_file_size)
+            return
 
-        # Запускаем поиск в отдельном потоке
-        self.search_thread = threading.Thread(
-            target=self.run_search,
-            args=(extensions, self.update_progress_callback),  # Передаем callback
-            name="search-worker"
+        self._launch_search(
+            extensions=extensions,
+            signature=signature,
+            max_file_size=max_file_size,
+            resume_state=None,
+            resume_skipped_count=0,
+            resume_error_count=0,
+            resume_skip_reasons={},
+            pre_count_enabled=False,
         )
-        self.search_thread.daemon = True
-        self._begin_search_preparation_ui()
-        self.search_thread.start()
 
     def _begin_search_preparation_ui(self):
         """Показывает, что поиск запускается после подсчёта файлов."""
@@ -1962,6 +2135,7 @@ class SearchApp:
         self.is_closing = True
         self.is_searching = False
         self.is_paused = False
+        self.precount_cancel_requested = True
         self.start_button.config(state=tk.DISABLED)
         self.pause_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.DISABLED)
@@ -1972,8 +2146,9 @@ class SearchApp:
         """Дожидается завершения фоновых потоков и закрывает окно."""
         search_alive = self.search_thread is not None and self.search_thread.is_alive()
         add_alive = self.directory_add_thread is not None and self.directory_add_thread.is_alive()
+        precount_alive = self.precount_thread is not None and self.precount_thread.is_alive()
 
-        if search_alive or add_alive:
+        if search_alive or add_alive or precount_alive:
             self.safe_after(100, self._finish_close_when_ready, allow_when_closing=True)
             return
 
@@ -1985,6 +2160,7 @@ class SearchApp:
             pass
 
         try:
+            self.save_search_state()
             self.save_keywords_to_file()
             self.update_config(reload_after_save=False)
         finally:
@@ -2053,7 +2229,18 @@ def main():
     )
     password_is_valid = entered_password == APP_PASSWORD
 
-    app = SearchApp(root)
+    app = None
+    try:
+        app = SearchApp(root)
+    except Exception as exc:
+        log_path = write_crash_report("Ошибка запуска приложения", exc, exc.__traceback__)
+        messagebox.showerror(
+            "Ошибка запуска",
+            f"Не удалось запустить приложение:\n{exc}\n\nПодробности: {log_path}",
+            parent=root,
+        )
+        root.destroy()
+        return
 
     def handle_unhandled_exception(error_title, exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -2062,21 +2249,22 @@ def main():
 
         log_path = write_crash_report(error_title, exc_value, exc_traceback)
         logging.error("%s: %s", error_title, exc_value)
-        app.mark_search_crashed(error_title, exc_value)
-        try:
-            app.safe_after(
-                0,
-                app._show_runtime_error_dialog,
-                "Критическая ошибка",
-                (
-                    f"{error_title}\n\n"
-                    f"{exc_value}\n\n"
-                    f"Подробности сохранены в файле:\n{log_path}\n\n"
-                    "Если ошибка была нефатальной, приложение продолжит работу."
+        if app is not None:
+            app.mark_search_crashed(error_title, exc_value)
+            try:
+                app.safe_after(
+                    0,
+                    app._show_runtime_error_dialog,
+                    "Критическая ошибка",
+                    (
+                        f"{error_title}\n\n"
+                        f"{exc_value}\n\n"
+                        f"Подробности сохранены в файле:\n{log_path}\n\n"
+                        "Если ошибка была нефатальной, приложение продолжит работу."
+                    ),
                 )
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     sys.excepthook = lambda exc_type, exc_value, exc_traceback: handle_unhandled_exception(
         "Необработанная ошибка приложения",

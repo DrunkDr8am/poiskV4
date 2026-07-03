@@ -1,24 +1,91 @@
 import os
-import fnmatch
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Callable, Optional
 
 import logging
 
 from file_processing import process_file_with_meta  # Импортируем функцию обработки файла
 
 SEARCH_RESULTS_ENCODING = 'utf-8-sig'
-# Для очень больших очередей stat() на каждый файл блокирует старт на минуты.
-LARGE_QUEUE_SORT_LIMIT = 5000
+PRECOUNT_PROGRESS_INTERVAL = 500
 
 
-def _file_size_sort_key(file_path: str) -> int:
-    """Ключ сортировки: сначала маленькие файлы, тяжёлые — в конец очереди."""
-    try:
-        return os.path.getsize(file_path)
-    except OSError:
-        return 0
+def extension_patterns_to_suffixes(extensions: List[str]) -> Set[str]:
+    """Преобразует маски вида *.pdf в множество суффиксов (.pdf)."""
+    suffixes = set()
+    for pattern in extensions:
+        normalized = str(pattern).strip().lower()
+        if not normalized:
+            continue
+        if normalized.startswith('*.'):
+            suffixes.add(normalized[1:])
+        elif normalized.startswith('*'):
+            suffix = normalized[1:]
+            if suffix and not suffix.startswith('.'):
+                suffix = f".{suffix}"
+            if suffix:
+                suffixes.add(suffix)
+        elif normalized.startswith('.'):
+            suffixes.add(normalized)
+        else:
+            suffixes.add(f".{normalized}")
+    return suffixes
+
+
+def file_matches_extension_suffixes(filename: str, suffixes: Set[str]) -> bool:
+    """Быстрая проверка расширения файла по набору суффиксов."""
+    if not suffixes:
+        return False
+    name_lower = filename.lower()
+    return any(name_lower.endswith(suffix) for suffix in suffixes)
+
+
+def collect_matching_files(
+    directory: str,
+    extensions: List[str],
+    progress_callback: Optional[Callable[[int], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[str]:
+    """Собирает пути файлов с нужными расширениями через os.scandir."""
+    suffixes = extension_patterns_to_suffixes(extensions)
+    if not suffixes:
+        return []
+
+    collected: List[str] = []
+    pending_dirs = [directory]
+    matched_count = 0
+
+    while pending_dirs:
+        if cancel_check and cancel_check():
+            break
+
+        current_dir = pending_dirs.pop()
+        try:
+            with os.scandir(current_dir) as entries:
+                for entry in entries:
+                    if cancel_check and cancel_check():
+                        return collected
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending_dirs.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            if file_matches_extension_suffixes(entry.name, suffixes):
+                                collected.append(entry.path)
+                                matched_count += 1
+                                if (
+                                    progress_callback
+                                    and matched_count % PRECOUNT_PROGRESS_INTERVAL == 0
+                                ):
+                                    progress_callback(matched_count)
+                    except OSError:
+                        continue
+        except OSError as exc:
+            logging.warning(f"Не удалось прочитать каталог {current_dir}: {exc}")
+
+    if progress_callback and matched_count:
+        progress_callback(matched_count)
+    return collected
 
 
 def _wait_if_paused(is_paused_func: callable = None, is_searching_func: callable = None) -> bool:
@@ -76,6 +143,7 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 continue
             files_to_process.append(file_path)
     else:
+        suffixes = extension_patterns_to_suffixes(extensions)
         for root, _, files in os.walk(root_dir):
             if not _wait_if_paused(is_paused_func, is_searching_func):
                 break
@@ -86,29 +154,13 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                 break
 
             for file in files:
+                if not file_matches_extension_suffixes(file, suffixes):
+                    continue
                 file_path = os.path.join(root, file)
-                if any(fnmatch.fnmatch(file, ext_pattern) for ext_pattern in extensions):
-                    if file_path in already_processed_set:
-                        skipped_processed += 1
-                        continue
-                    files_to_process.append(file_path)
-
-    if progress_callback and callable(progress_callback):
-        try:
-            if len(files_to_process) > LARGE_QUEUE_SORT_LIMIT:
-                progress_callback("Подготовка: очередь из большого числа файлов...", None)
-            else:
-                progress_callback("Подготовка: сортировка файлов по размеру...", None)
-        except Exception as e:
-            logging.error(f"Ошибка в callback подготовки очереди: {e}")
-
-    if len(files_to_process) <= LARGE_QUEUE_SORT_LIMIT:
-        files_to_process.sort(key=_file_size_sort_key)
-    else:
-        logging.info(
-            f"Сортировка по размеру пропущена для {len(files_to_process)} файлов "
-            f"(порог {LARGE_QUEUE_SORT_LIMIT})"
-        )
+                if file_path in already_processed_set:
+                    skipped_processed += 1
+                    continue
+                files_to_process.append(file_path)
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")
     if skipped_processed:
