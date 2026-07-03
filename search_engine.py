@@ -9,6 +9,8 @@ import logging
 from file_processing import process_file_with_meta  # Импортируем функцию обработки файла
 
 SEARCH_RESULTS_ENCODING = 'utf-8-sig'
+# Для очень больших очередей stat() на каждый файл блокирует старт на минуты.
+LARGE_QUEUE_SORT_LIMIT = 5000
 
 
 def _file_size_sort_key(file_path: str) -> int:
@@ -91,7 +93,22 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                         continue
                     files_to_process.append(file_path)
 
-    files_to_process.sort(key=_file_size_sort_key)
+    if progress_callback and callable(progress_callback):
+        try:
+            if len(files_to_process) > LARGE_QUEUE_SORT_LIMIT:
+                progress_callback("Подготовка: очередь из большого числа файлов...", None)
+            else:
+                progress_callback("Подготовка: сортировка файлов по размеру...", None)
+        except Exception as e:
+            logging.error(f"Ошибка в callback подготовки очереди: {e}")
+
+    if len(files_to_process) <= LARGE_QUEUE_SORT_LIMIT:
+        files_to_process.sort(key=_file_size_sort_key)
+    else:
+        logging.info(
+            f"Сортировка по размеру пропущена для {len(files_to_process)} файлов "
+            f"(порог {LARGE_QUEUE_SORT_LIMIT})"
+        )
 
     logging.info(f"Найдено файлов для обработки в {root_dir}: {len(files_to_process)}")
     if skipped_processed:

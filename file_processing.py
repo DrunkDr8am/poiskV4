@@ -289,7 +289,11 @@ def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config: dict, pd
 
 
 def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, config: dict, pdf_path: str, page_index: int) -> str:
-    """OCR страницы-скана: сначала встроенные изображения, иначе растеризация страницы."""
+    """OCR страницы-скана: растеризация страницы даёт лучший результат, чем smask-изображения."""
+    page_text = _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config, pdf_path, page_index)
+    if (page_text or "").strip():
+        return page_text
+
     ocr_chunks = []
     for img in page.get_images(full=True):
         try:
@@ -304,10 +308,7 @@ def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, config: di
         except Exception:
             continue
 
-    if ocr_chunks:
-        return "\n".join(ocr_chunks)
-
-    return _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config, pdf_path, page_index)
+    return "\n".join(ocr_chunks)
 
 
 def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], keywords_substr: Set[str],

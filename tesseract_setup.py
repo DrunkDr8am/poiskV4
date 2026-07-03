@@ -109,8 +109,17 @@ def setup_tesseract():
                 return _TESSERACT_READY
         else:
             logging.warning("Портативный Tesseract не найден или неполная установка")
-            _TESSERACT_READY = False
-            return _TESSERACT_READY
+            try:
+                import pytesseract
+                _patch_pytesseract_no_window(pytesseract)
+                version = pytesseract.get_tesseract_version()
+                logging.info(f"Используется системный Tesseract OCR: версия {version}")
+                _TESSERACT_READY = True
+                return _TESSERACT_READY
+            except Exception as system_error:
+                logging.warning(f"Системный Tesseract недоступен: {system_error}")
+                _TESSERACT_READY = False
+                return _TESSERACT_READY
     except Exception as e:
         logging.error(f"Ошибка при настройке портативного Tesseract: {e}")
         _TESSERACT_READY = False
