@@ -91,10 +91,15 @@ def ocr_cache_put(cache_key: str, text: str) -> None:
 
 def _get_ocr_threads_limit(config: dict) -> int:
     try:
-        limit = int(config.get('ocr_threads', 2) or 2)
+        ocr_threads = int(config.get('ocr_threads', 2))
     except (TypeError, ValueError):
-        limit = 2
-    return max(1, limit)
+        ocr_threads = 2
+    if ocr_threads <= 0:
+        try:
+            ocr_threads = int(config.get('threads', 1) or 1)
+        except (TypeError, ValueError):
+            ocr_threads = 1
+    return max(1, ocr_threads)
 
 
 def _get_ocr_semaphore(config: dict) -> threading.Semaphore:

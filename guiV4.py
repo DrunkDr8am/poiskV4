@@ -38,6 +38,7 @@ INVALID_PASSWORD_TICK_MS = 1000
 CRASH_LOG_FILE = "crash_log.txt"
 SEARCH_STATE_DB_FILE = "search_state.db"
 SEARCH_STATE_VERSION = 1
+CANDIDATE_FILES_BATCH_SIZE = 2000
 
 
 def write_crash_report(error_title, exc_value, exc_traceback):
@@ -182,14 +183,20 @@ class SearchApp:
         self.threads_var.set(str(threads))
         return threads
 
-    def normalize_ocr_threads_value(self):
-        """Нормализует количество OCR-потоков в диапазон [1, cpu_count]."""
+    def normalize_ocr_threads_value(self, for_runtime=False):
+        """Нормализует OCR-потоки. 0 в настройках = столько же, сколько потоков поиска."""
         max_threads = self.get_max_threads_count()
         try:
             ocr_threads = int(self.ocr_threads_var.get())
         except (TypeError, ValueError):
-            ocr_threads = self.get_default_ocr_threads_count()
-        ocr_threads = max(1, min(ocr_threads, max_threads))
+            ocr_threads = 0
+
+        if for_runtime:
+            if ocr_threads <= 0:
+                return self.normalize_threads_value()
+            return max(1, min(ocr_threads, max_threads))
+
+        ocr_threads = max(0, min(ocr_threads, max_threads))
         self.ocr_threads_var.set(str(ocr_threads))
         return ocr_threads
 
@@ -206,9 +213,9 @@ class SearchApp:
         max_threads = self.get_max_threads_count()
 
         if not filtered:
-            new_value = "1"
+            new_value = "0"
         else:
-            new_value = str(min(max(1, int(filtered)), max_threads))
+            new_value = str(min(max(0, int(filtered)), max_threads))
 
         if new_value != value:
             self._updating_ocr_threads_var = True
@@ -496,12 +503,12 @@ class SearchApp:
         )
         threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="OCR-потоки (Tesseract):").grid(row=3, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="OCR-потоки (Tesseract, 0=как потоки поиска):").grid(row=3, column=0, sticky=tk.W, pady=3)
         default_ocr_threads = str(self.config['config'].get('ocr_threads', self.get_default_ocr_threads_count()))
         self.ocr_threads_var = tk.StringVar(value=default_ocr_threads)
         self.ocr_threads_var.trace_add("write", self.on_ocr_threads_var_change)
         ocr_threads_spin = ttk.Spinbox(
-            settings_tab, from_=1, to=self.get_max_threads_count(), textvariable=self.ocr_threads_var, width=8
+            settings_tab, from_=0, to=self.get_max_threads_count(), textvariable=self.ocr_threads_var, width=8
         )
         ocr_threads_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
 
@@ -555,7 +562,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.8 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.0.9 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -722,6 +729,15 @@ class SearchApp:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS candidate_files (
+                        directory TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        PRIMARY KEY (directory, path)
+                    )
+                    """
+                )
                 conn.commit()
         except Exception as exc:
             logging.error(f"Не удалось инициализировать {SEARCH_STATE_DB_FILE}: {exc}")
@@ -788,6 +804,83 @@ class SearchApp:
             logging.warning(f"Не удалось загрузить processed_files из {SEARCH_STATE_DB_FILE}: {exc}")
             return set()
 
+    @staticmethod
+    def _normalize_directory_key(directory):
+        return os.path.normcase(os.path.normpath(directory))
+
+    def _clear_candidate_files_db(self):
+        """Удаляет сохранённый список файлов для подсчёта/возобновления."""
+        if sqlite3 is None:
+            return
+        try:
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                conn.execute("DELETE FROM candidate_files")
+                conn.commit()
+        except Exception as exc:
+            logging.error(f"Не удалось очистить candidate_files: {exc}")
+
+    def _has_candidate_files_in_db(self):
+        if sqlite3 is None or not os.path.exists(SEARCH_STATE_DB_FILE):
+            return False
+        try:
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM candidate_files").fetchone()
+                return bool(row and int(row[0]) > 0)
+        except Exception as exc:
+            logging.warning(f"Не удалось проверить candidate_files: {exc}")
+            return False
+
+    def _persist_candidate_files(self, files_map):
+        """Сохраняет полный список файлов сессии для возобновления без повторного обхода диска."""
+        if sqlite3 is None or not files_map:
+            return
+        rows = []
+        for directory, paths in files_map.items():
+            directory_key = self._normalize_directory_key(directory)
+            for path in paths:
+                rows.append((directory_key, path))
+        if not rows:
+            return
+        try:
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                conn.execute("BEGIN")
+                conn.execute("DELETE FROM candidate_files")
+                for offset in range(0, len(rows), CANDIDATE_FILES_BATCH_SIZE):
+                    batch = rows[offset:offset + CANDIDATE_FILES_BATCH_SIZE]
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO candidate_files(directory, path) VALUES(?, ?)",
+                        batch,
+                    )
+                conn.commit()
+            logging.info(f"Сохранён список файлов для возобновления: {len(rows)}")
+        except Exception as exc:
+            logging.error(f"Не удалось сохранить candidate_files: {exc}")
+
+    def _load_pending_files_map(self, processed_set):
+        """Возвращает по директориям только файлы, ещё не обработанные в текущей сессии."""
+        if sqlite3 is None or not os.path.exists(SEARCH_STATE_DB_FILE):
+            return {}
+
+        pending_by_directory = {directory: [] for directory in self.directories_list}
+        try:
+            with sqlite3.connect(SEARCH_STATE_DB_FILE) as conn:
+                rows = conn.execute("SELECT directory, path FROM candidate_files").fetchall()
+            lookup = {self._normalize_directory_key(directory): directory for directory in self.directories_list}
+            for directory_key, path in rows:
+                if path in processed_set:
+                    continue
+                original_directory = lookup.get(directory_key)
+                if original_directory is not None:
+                    pending_by_directory[original_directory].append(path)
+            pending_total = sum(len(paths) for paths in pending_by_directory.values())
+            logging.info(
+                f"Загружено необработанных файлов из сохранённого списка: {pending_total}"
+            )
+            return pending_by_directory
+        except Exception as exc:
+            logging.warning(f"Не удалось загрузить candidate_files: {exc}")
+            return {}
+
     def _load_search_state_from_sqlite(self, include_processed_paths=False):
         """Читает состояние из SQLite."""
         if sqlite3 is None or not os.path.exists(SEARCH_STATE_DB_FILE):
@@ -847,6 +940,7 @@ class SearchApp:
                 )
                 if should_reset_table:
                     conn.execute("DELETE FROM processed_files")
+                    conn.execute("DELETE FROM candidate_files")
                     saved_processed_count = 0
                 if pending_paths:
                     conn.executemany(
@@ -992,6 +1086,7 @@ class SearchApp:
             with sqlite3.connect(SEARCH_STATE_DB_FILE, timeout=5) as conn:
                 conn.execute("DELETE FROM state_kv")
                 conn.execute("DELETE FROM processed_files")
+                conn.execute("DELETE FROM candidate_files")
                 conn.execute("DELETE FROM search_results")
                 conn.commit()
         except Exception as exc:
@@ -1702,6 +1797,8 @@ class SearchApp:
         start_message = f"Поиск начат: {self.search_start_time}"
         logging.info(start_message)
         self.prepare_search_state(signature, self.total_files, resume_state=resume_state)
+        if resume_state is None and self.directory_files_map:
+            self._persist_candidate_files(self.directory_files_map)
         self.reset_dashboard(
             self.total_files,
             self.resume_start_count,
@@ -1721,7 +1818,7 @@ class SearchApp:
         self.config['config']['has_7z'] = HAS_7Z
         self.config['config']['has_rar'] = HAS_RAR
         self.config['config']['has_ocr'] = HAS_OCR
-        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value()
+        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value(for_runtime=True)
 
         try:
             self.ensure_search_file_logging('search_log.txt')
@@ -1860,7 +1957,13 @@ class SearchApp:
                 return
             if resume_choice:
                 resume_state = previous_state
-                self.resume_paths_pending_load = True
+                self.resume_processed_files = self._load_processed_files_set()
+                if self._has_candidate_files_in_db():
+                    self.directory_files_map = self._load_pending_files_map(self.resume_processed_files)
+                    self.resume_paths_pending_load = False
+                else:
+                    self.directory_files_map = {}
+                    self.resume_paths_pending_load = True
                 self.resume_start_count = previous_processed_count
                 self.total_files = previous_total
                 resume_skipped_count = int(previous_state.get("skipped_count", 0))
@@ -1946,6 +2049,8 @@ class SearchApp:
             if self.resume_paths_pending_load:
                 self.safe_after(0, self.update_progress, "Подготовка: загрузка состояния возобновления...")
                 self.resume_processed_files = self._load_processed_files_set()
+                if self._has_candidate_files_in_db():
+                    self.directory_files_map = self._load_pending_files_map(self.resume_processed_files)
                 self.resume_paths_pending_load = False
                 self.processed_files = len(self.resume_processed_files)
                 self.safe_after(0, self.update_dashboard_labels)
@@ -1953,6 +2058,7 @@ class SearchApp:
             self.processed_files = self.resume_start_count
             threads_count = self.normalize_threads_value()
             logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
+            use_saved_candidates = self._has_candidate_files_in_db()
 
             # Выполняем поиск для каждой директории с накоплением счетчика
             for directory in self.directories_list:
@@ -1965,6 +2071,14 @@ class SearchApp:
 
                     # Обновляем статус - начало обработки директории
                     self.safe_after(0, self.update_progress, f"Начата обработка: {os.path.basename(directory)}")
+
+                    if use_saved_candidates:
+                        if directory in self.directory_files_map:
+                            candidate_files = self.directory_files_map[directory]
+                        else:
+                            candidate_files = []
+                    else:
+                        candidate_files = self.directory_files_map.get(directory)
 
                     # Используем модифицированную функцию поиска с прогрессом
                     results = search_files(
@@ -1981,7 +2095,7 @@ class SearchApp:
                         lambda: self.is_paused,
                         self.resume_processed_files,
                         self.update_search_state_checkpoint,
-                        self.directory_files_map.get(directory)
+                        candidate_files
                     )
 
                     # Показываем результаты для текущей директории
