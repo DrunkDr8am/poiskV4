@@ -7,7 +7,7 @@ import threading
 from typing import Optional
 
 _ocr_ready: Optional[bool] = None
-_ocr_backend: str = "none"  # rapidocr | tesseract | none
+_ocr_backend: str = "none"  # rapidocr_cyrillic | tesseract | none
 _rapidocr_local = threading.local()
 _tesseract_ready = False
 _init_lock = threading.Lock()
@@ -22,16 +22,16 @@ def is_ocr_available() -> bool:
 
 
 def setup_ocr() -> bool:
-    """Инициализирует OCR: сначала RapidOCR, иначе Tesseract."""
+    """Инициализирует OCR: сначала RapidOCR (кириллица), иначе Tesseract."""
     global _ocr_ready, _ocr_backend, _tesseract_ready
     with _init_lock:
         if _ocr_ready is not None:
             return _ocr_ready
 
         if _try_init_rapidocr():
-            _ocr_backend = "rapidocr"
+            _ocr_backend = "rapidocr_cyrillic"
             _ocr_ready = True
-            logging.info("OCR: используется RapidOCR (ONNX Runtime)")
+            logging.info("OCR: используется RapidOCR (кириллица, ONNX Runtime)")
             return True
 
         try:
@@ -54,13 +54,25 @@ def setup_ocr() -> bool:
         return False
 
 
+def _build_rapidocr_engine():
+    """Создаёт RapidOCR с моделью распознавания кириллицы (русский и др.)."""
+    from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR  # type: ignore
+
+    return RapidOCR(
+        params={
+            "Rec.lang_type": LangRec.CYRILLIC,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+            "Rec.model_type": ModelType.MOBILE,
+        }
+    )
+
+
 def _try_init_rapidocr() -> bool:
     try:
-        from rapidocr import RapidOCR  # type: ignore
         import numpy as np  # type: ignore
         from PIL import Image  # type: ignore
 
-        engine = RapidOCR()
+        engine = _build_rapidocr_engine()
         # Прогрев: убеждаемся, что модели грузятся без падения.
         probe = Image.new("RGB", (64, 32), color="white")
         engine(np.asarray(probe))
@@ -75,9 +87,7 @@ def _get_rapidocr_engine():
     engine = getattr(_rapidocr_local, "engine", None)
     if engine is not None:
         return engine
-    from rapidocr import RapidOCR  # type: ignore
-
-    engine = RapidOCR()
+    engine = _build_rapidocr_engine()
     _rapidocr_local.engine = engine
     return engine
 
@@ -158,7 +168,7 @@ def ocr_pil_image(
     image = _normalize_pil(pil_img, preprocess=preprocess)
 
     try:
-        if _ocr_backend == "rapidocr":
+        if _ocr_backend.startswith("rapidocr"):
             return _ocr_with_rapidocr(image)
         if _ocr_backend == "tesseract":
             return _ocr_with_tesseract(

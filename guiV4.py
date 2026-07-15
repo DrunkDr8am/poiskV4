@@ -512,7 +512,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.1.0 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.1.1 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
