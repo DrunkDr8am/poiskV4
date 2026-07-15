@@ -2,10 +2,8 @@ import os
 import fnmatch
 import zipfile
 import tempfile
-import threading
-import hashlib
 from io import BytesIO
-from typing import Set, Dict, List, Optional, Callable
+from typing import Set, Dict, List, Optional
 import logging
 import re
 import json
@@ -30,113 +28,25 @@ WORD_EXTENSIONS = ('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')
 EXCEL_EXTENSIONS = ('.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm')
 PDF_SUBPROCESS_TIMEOUT_SEC = 300
 PDF_OCR_TESSERACT_CONFIG = '--oem 3 --psm 3'
-PDF_OCR_RENDER_ZOOM = 1.5
+# Качество растеризации PDF для OCR (zoom):
+# high / medium / low / very_low
+PDF_OCR_QUALITY_ZOOM = {
+    'high': 2.0,
+    'medium': 1.5,
+    'low': 1.0,
+    'very_low': 0.75,
+}
+PDF_OCR_RENDER_ZOOM = PDF_OCR_QUALITY_ZOOM['medium']
+PDF_OCR_QUALITY_VALUES = frozenset(PDF_OCR_QUALITY_ZOOM)
 WORD_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 XML_TAG_PATTERN = re.compile(rb"<[^>]+>")
 XLSX_EMPTY_ROW_STREAK_LIMIT = 200
 
-_OCR_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ocr_cache')
-_ocr_memory_cache: Dict[str, str] = {}
-_ocr_memory_cache_lock = threading.Lock()
-_OCR_MEMORY_CACHE_MAX = 256
 
-
-def _make_ocr_cache_key(*parts) -> str:
-    payload = "|".join(str(part) for part in parts)
-    return hashlib.sha256(payload.encode('utf-8', errors='replace')).hexdigest()
-
-
-def _ocr_disk_cache_path(cache_key: str) -> str:
-    return os.path.join(_OCR_CACHE_DIR, f"{cache_key}.txt")
-
-
-def ocr_cache_get(cache_key: str) -> Optional[str]:
-    with _ocr_memory_cache_lock:
-        if cache_key in _ocr_memory_cache:
-            return _ocr_memory_cache[cache_key]
-
-    cache_path = _ocr_disk_cache_path(cache_key)
-    if not os.path.isfile(cache_path):
-        return None
-
-    try:
-        with open(cache_path, 'r', encoding='utf-8') as cache_file:
-            text = cache_file.read()
-    except OSError:
-        return None
-
-    with _ocr_memory_cache_lock:
-        _ocr_memory_cache[cache_key] = text
-        if len(_ocr_memory_cache) > _OCR_MEMORY_CACHE_MAX:
-            _ocr_memory_cache.pop(next(iter(_ocr_memory_cache)))
-    return text
-
-
-def ocr_cache_put(cache_key: str, text: str) -> None:
-    with _ocr_memory_cache_lock:
-        _ocr_memory_cache[cache_key] = text
-        if len(_ocr_memory_cache) > _OCR_MEMORY_CACHE_MAX:
-            _ocr_memory_cache.pop(next(iter(_ocr_memory_cache)))
-
-    try:
-        os.makedirs(_OCR_CACHE_DIR, exist_ok=True)
-        with open(_ocr_disk_cache_path(cache_key), 'w', encoding='utf-8') as cache_file:
-            cache_file.write(text)
-    except OSError as exc:
-        logging.debug(f"Не удалось сохранить OCR-кэш {cache_key}: {exc}")
-
-
-def _execute_ocr(cache_key: str, config: dict, ocr_runner: Callable[[], str]) -> str:
-    """OCR в том же потоке поиска; отдельного лимита OCR-потоков нет."""
-    cached_text = ocr_cache_get(cache_key)
-    if cached_text is not None:
-        return cached_text
-
-    text = ocr_runner()
-    ocr_cache_put(cache_key, text)
-    return text
-
-
-def _file_ocr_cache_key(file_path: str, config: dict) -> str:
-    stat = os.stat(file_path)
-    return _make_ocr_cache_key(
-        os.path.abspath(file_path),
-        stat.st_mtime_ns,
-        stat.st_size,
-        _ocr_backend_tag(),
-        config.get('tesseract_languages', 'rus'),
-        config.get('tesseract_config', '--oem 3 --psm 6'),
-    )
-
-
-def _pil_image_cache_key(pil_img, config: dict, preprocess: bool) -> str:
-    buffer = BytesIO()
-    pil_img.save(buffer, format='PNG')
-    return _make_ocr_cache_key(
-        buffer.getvalue(),
-        _ocr_backend_tag(),
-        config.get('tesseract_languages', 'rus'),
-        config.get('tesseract_config', '--oem 3 --psm 6'),
-        preprocess,
-    )
-
-
-def _pdf_page_cache_key(pdf_path: str, page_index: int, xref: Optional[int], config: dict, mode: str, preprocess: bool) -> str:
-    stat = os.stat(pdf_path)
-    return _make_ocr_cache_key(
-        _ocr_backend_tag(),
-        os.path.abspath(pdf_path),
-        stat.st_mtime_ns,
-        stat.st_size,
-        page_index,
-        xref if xref is not None else mode,
-        mode,
-        config.get('tesseract_languages', 'rus'),
-        config.get('tesseract_config', '--oem 3 --psm 6'),
-        preprocess,
-        PDF_OCR_RENDER_ZOOM,
-    )
-
+def _pdf_ocr_render_zoom(config: Optional[dict] = None) -> float:
+    """Возвращает zoom растеризации PDF по настройке качества OCR."""
+    quality = str((config or {}).get('pdf_ocr_quality', 'medium') or 'medium').strip().lower()
+    return float(PDF_OCR_QUALITY_ZOOM.get(quality, PDF_OCR_QUALITY_ZOOM['medium']))
 
 def _extract_json_from_stdout(stdout_text: str) -> Dict:
     """Пытается извлечь JSON-объект даже при «шуме» в stdout."""
@@ -160,29 +70,14 @@ def _extract_json_from_stdout(stdout_text: str) -> Dict:
         return {}
 
 
-def _ocr_backend_tag() -> str:
-    try:
-        from ocr_engine import get_ocr_backend
-
-        return get_ocr_backend() or "none"
-    except Exception:
-        return "none"
-
-
-def _ocr_pil_image_cached(
+def _ocr_pil_image(
     pil_img,
     config: dict,
     preprocess: bool = True,
-    cache_key: Optional[str] = None,
 ) -> str:
     from ocr_engine import ocr_pil_image
 
-    resolved_cache_key = cache_key or _pil_image_cache_key(pil_img, config, preprocess)
-
-    def run_ocr() -> str:
-        return ocr_pil_image(pil_img, config=config, preprocess=preprocess)
-
-    return _execute_ocr(resolved_cache_key, config, run_ocr)
+    return ocr_pil_image(pil_img, config=config, preprocess=preprocess)
 
 
 def _extract_embedded_pdf_image(doc, xref: int, Image):
@@ -208,23 +103,16 @@ def _extract_embedded_pdf_image(doc, xref: int, Image):
 
 def _ocr_pdf_page_pixmap(page, fitz_module, Image, config: dict, pdf_path: str, page_index: int) -> str:
     """OCR всей страницы PDF как растрового изображения."""
-    from ocr_engine import ocr_pil_image
-
-    cache_key = _pdf_page_cache_key(pdf_path, page_index, None, config, 'pixmap', True)
-
-    def run_ocr() -> str:
-        try:
-            zoom = PDF_OCR_RENDER_ZOOM
-            matrix = fitz_module.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            if pix.width <= 0 or pix.height <= 0:
-                return ""
-            pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            return ocr_pil_image(pil_img, config=config, preprocess=True)
-        except Exception:
+    try:
+        zoom = _pdf_ocr_render_zoom(config)
+        matrix = fitz_module.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        if pix.width <= 0 or pix.height <= 0:
             return ""
-
-    return _execute_ocr(cache_key, config, run_ocr)
+        pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        return _ocr_pil_image(pil_img, config, True)
+    except Exception:
+        return ""
 
 
 def _ocr_pdf_scanned_page(page, doc, fitz_module, Image, config: dict, pdf_path: str, page_index: int) -> str:
@@ -240,8 +128,7 @@ def _ocr_pdf_scanned_page(page, doc, fitz_module, Image, config: dict, pdf_path:
             pil_img = _extract_embedded_pdf_image(doc, xref, Image)
             if pil_img is None:
                 continue
-            cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', True)
-            embedded_text = _ocr_pil_image_cached(pil_img, config, True, cache_key)
+            embedded_text = _ocr_pil_image(pil_img, config, True)
             if embedded_text:
                 ocr_chunks.append(embedded_text)
         except Exception:
@@ -296,10 +183,7 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
                         pil_img = _extract_embedded_pdf_image(doc, xref, Image)
                         if pil_img is None:
                             continue
-                        cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', False)
-                        ocr_text = _ocr_pil_image_cached(
-                            pil_img, config, False, cache_key
-                        )
+                        ocr_text = _ocr_pil_image(pil_img, config, False)
                         found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
                         if keywords_all and found.issuperset(keywords_all):
                             break
@@ -702,11 +586,9 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
     try:
         if isinstance(image_data, BytesIO):
             img = Image.open(image_data)
-            cache_key = _pil_image_cache_key(img, config, False)
         else:
             if not os.path.isfile(image_data):
                 return set()
-            cache_key = _file_ocr_cache_key(image_data, config)
             img = Image.open(image_data)
 
         if img.mode == 'P' and 'transparency' in img.info:
@@ -717,7 +599,7 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         elif img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
 
-        text = _ocr_pil_image_cached(img, config, False, cache_key)
+        text = _ocr_pil_image(img, config, False)
         return search_in_text(text)
     except Exception as e:
         logging.error(f"Ошибка обработки изображения {image_data}: {e}")
@@ -755,6 +637,7 @@ def _search_in_pdf_inprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+        "pdf_ocr_quality": config.get("pdf_ocr_quality", "medium"),
     }
     _ensure_ocr_for_pdf(payload_config)
     try:
@@ -777,6 +660,7 @@ def _search_in_pdf_subprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
+        "pdf_ocr_quality": config.get("pdf_ocr_quality", "medium"),
     }
 
     worker_args = [

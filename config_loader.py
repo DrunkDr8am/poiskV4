@@ -52,6 +52,8 @@ def load_config(config_file="config.txt"):
         # Параметры для тонкой настройки
         'max_pdf_pages': '0',  # 0 = без ограничения
         'max_path_length': '240',
+        # Качество OCR для PDF: high / medium / low / very_low
+        'pdf_ocr_quality': 'medium',
     }
 
     # Если файл конфигурации существует, загружаем его
@@ -83,6 +85,11 @@ def load_config(config_file="config.txt"):
     tesseract_config = config.get('Settings', 'tesseract_config', fallback=defaults['tesseract_config'])
     max_pdf_pages = _safe_getint(config, 'Settings', 'max_pdf_pages', int(defaults['max_pdf_pages']))
     max_path_length = _safe_getint(config, 'Settings', 'max_path_length', int(defaults['max_path_length']))
+    pdf_ocr_quality = config.get(
+        'Settings', 'pdf_ocr_quality', fallback=defaults['pdf_ocr_quality']
+    ).strip().lower()
+    if pdf_ocr_quality not in ('high', 'medium', 'low', 'very_low'):
+        pdf_ocr_quality = 'medium'
 
     # Очищаем значения от пробелов
     extensions = [ext.strip() for ext in extensions]
@@ -117,6 +124,7 @@ def load_config(config_file="config.txt"):
         'tesseract_config': tesseract_config,
         'max_pdf_pages': max_pdf_pages,
         'max_path_length': max_path_length,
+        'pdf_ocr_quality': pdf_ocr_quality,
     }
 
 def create_default_config():
@@ -165,6 +173,9 @@ max_pdf_pages = 0
 
 # Максимальная длина пути к файлу (символов)
 max_path_length = 240
+
+# Качество OCR для страниц PDF: high / medium / low / very_low
+pdf_ocr_quality = medium
 
 """
 

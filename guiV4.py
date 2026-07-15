@@ -454,8 +454,14 @@ class SearchApp:
                 pass
 
         ttk.Label(settings_tab, text="Потоки:").grid(row=2, column=0, sticky=tk.W, pady=3)
-        auto_threads = self.get_auto_threads_count()
-        self.threads_var = tk.StringVar(value=str(auto_threads))
+        # Потоки из конфига; автозначение только при первом создании config.txt.
+        saved_threads = self.config['config'].get('threads', self.get_auto_threads_count())
+        try:
+            initial_threads = int(saved_threads)
+        except (TypeError, ValueError):
+            initial_threads = self.get_auto_threads_count()
+        initial_threads = max(1, min(initial_threads, self.get_max_threads_count()))
+        self.threads_var = tk.StringVar(value=str(initial_threads))
         self.threads_var.trace_add("write", self.on_threads_var_change)
         threads_spin = ttk.Spinbox(
             settings_tab, from_=1, to=self.get_max_threads_count(), textvariable=self.threads_var, width=8
@@ -478,15 +484,47 @@ class SearchApp:
         max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
         max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
+        quality_raw = str(self.config['config'].get('pdf_ocr_quality', 'medium') or 'medium').strip().lower()
+        if quality_raw not in ('high', 'medium', 'low', 'very_low'):
+            quality_raw = 'medium'
+        self.pdf_ocr_quality_var = tk.StringVar(value=quality_raw)
+        ttk.Label(settings_tab, text="Качество OCR PDF:").grid(row=6, column=0, sticky=tk.NW, pady=3)
+        quality_frame = ttk.Frame(settings_tab)
+        quality_frame.grid(row=6, column=1, sticky=tk.W, pady=3)
+        ttk.Radiobutton(
+            quality_frame,
+            text="Отличное качество",
+            variable=self.pdf_ocr_quality_var,
+            value="high",
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
+        ttk.Radiobutton(
+            quality_frame,
+            text="Среднее качество",
+            variable=self.pdf_ocr_quality_var,
+            value="medium",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 2))
+        ttk.Radiobutton(
+            quality_frame,
+            text="Низкое качество",
+            variable=self.pdf_ocr_quality_var,
+            value="low",
+        ).grid(row=2, column=0, sticky=tk.W, pady=(0, 2))
+        ttk.Radiobutton(
+            quality_frame,
+            text="Очень низкое качество",
+            variable=self.pdf_ocr_quality_var,
+            value="very_low",
+        ).grid(row=3, column=0, sticky=tk.W)
+
+        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=7, column=0, sticky=tk.W, pady=3)
         self.max_path_length_var = tk.StringVar(value=str(self.config['config'].get('max_path_length', 240)))
         max_path_spin = ttk.Spinbox(settings_tab, from_=0, to=10000, textvariable=self.max_path_length_var, width=10)
-        max_path_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
+        max_path_spin.grid(row=7, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=7, column=0, sticky=tk.NW, pady=(8, 3))
+        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=8, column=0, sticky=tk.NW, pady=(8, 3))
         self.pre_count_files_var = tk.BooleanVar(value=bool(self.config['config'].get('pre_count_files', True)))
         launch_mode_frame = ttk.Frame(settings_tab)
-        launch_mode_frame.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
+        launch_mode_frame.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
         ttk.Radiobutton(
             launch_mode_frame,
             text="Сначала считать файлы, затем искать",
@@ -500,21 +538,21 @@ class SearchApp:
             value=False
         ).grid(row=1, column=0, sticky=tk.W)
 
-        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=8, column=0, sticky=tk.W, pady=(8, 3))
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=9, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
-        self.theme_toggle_button.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button.grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
 
         ttk.Button(
             settings_tab,
             text="Сбросить состояние поиска",
             command=self.reset_search_state
-        ).grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
+        ).grid(row=10, column=1, sticky=tk.W, pady=(8, 3))
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.1.1 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.2.0 | Автор: Андрей ОБИС 2026"
         )
-        footer_info.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
+        footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
@@ -1369,7 +1407,12 @@ class SearchApp:
                 elif file_name.startswith("Готово:"):
                     progress_text += f" | {file_name}"
                 elif file_name == "Поиск завершен":
-                    progress_text = "Поиск завершен! Обработано всех файлов."
+                    # В конце поиска всегда показываем полный прогресс.
+                    self.processed_files = self.total_files
+                    self.progress_value.set(100)
+                    progress_text = (
+                        f"Поиск завершен! Обработано: {self.processed_files}/{self.total_files} файлов"
+                    )
                 else:
                     progress_text += f" | {display_name}"
 
@@ -1386,6 +1429,7 @@ class SearchApp:
                 elif file_name.startswith("Готово:"):
                     status_text += f" | {file_name}"
                 elif file_name == "Поиск завершен":
+                    self.progress_value.set(100)
                     status_text = f"Поиск завершен! Обработано файлов: {self.processed_files}"
                 else:
                     status_text += f" | {file_name}"
@@ -1838,8 +1882,7 @@ class SearchApp:
             messagebox.showwarning("Подождите", "Дождитесь завершения добавления директории.")
             return
 
-        # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
-        self.threads_var.set(str(self.get_auto_threads_count()))
+        # Используем потоки из настроек (авто только при первом создании конфига).
         self.normalize_threads_value()
 
         extensions = self.get_selected_extensions()
@@ -2016,7 +2059,12 @@ class SearchApp:
 
             self.processed_files = self.resume_start_count
             threads_count = self.normalize_threads_value()
-            logging.info(f"Начинаем поиск. Всего файлов: {self.total_files}")
+            logging.info(
+                f"Начинаем поиск. Всего файлов: {self.total_files}, "
+                f"потоков: {threads_count}, "
+                f"качество OCR PDF: {self.config['config'].get('pdf_ocr_quality', 'medium')}, "
+                f"макс. страниц PDF: {self.config['config'].get('max_pdf_pages', 0)}"
+            )
             use_saved_candidates = self._has_candidate_files_in_db()
 
             # Выполняем поиск для каждой директории с накоплением счетчика
@@ -2154,13 +2202,41 @@ class SearchApp:
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
         with self._ui_update_lock:
+            pending_progress = self._pending_progress_update
             self._pending_progress_update = None
             self._progress_update_scheduled = False
             self._dashboard_update_scheduled = False
+
+        # Не теряем последний throttled-апдейт прогресса.
+        if pending_progress is not None:
+            file_name, processed_count, in_flight = pending_progress
+            self._update_progress_in_main_thread(file_name, processed_count, in_flight)
+
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
         self.search_in_flight_count = 0
         self.directory_files_map = {}
+
+        search_status = ""
+        with self.search_state_lock:
+            if self.active_search_state:
+                search_status = str(self.active_search_state.get("status", "") or "")
+
+        # При нормальном завершении заполняем прогресс до 100%.
+        if search_status == "completed":
+            if self.total_files > 0:
+                self.processed_files = self.total_files
+                self.progress_value.set(100)
+                self.current_file.set(
+                    f"Поиск завершен! Обработано: {self.processed_files}/{self.total_files} файлов"
+                )
+            else:
+                self.progress_value.set(100)
+                if not self.current_file.get().startswith("Поиск завершен"):
+                    self.current_file.set(
+                        f"Поиск завершен! Обработано файлов: {self.processed_files}"
+                    )
+
         self.start_button.config(state=tk.NORMAL)
         self.pause_button.config(state=tk.DISABLED, text="Пауза")
         self.stop_button.config(state=tk.DISABLED)
@@ -2197,6 +2273,7 @@ class SearchApp:
             'tesseract_config': current_cfg.get('tesseract_config', '--oem 3 --psm 6'),
             # Новые параметры для тонкой настройки поиска
             'max_pdf_pages': self.max_pdf_pages_var.get(),
+            'pdf_ocr_quality': self.pdf_ocr_quality_var.get() or 'medium',
         }
 
         # Сохраняем конфиг

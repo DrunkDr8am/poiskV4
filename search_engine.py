@@ -192,7 +192,8 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
     try:
         files_iter = iter(files_to_process)
         in_flight = {}
-        max_in_flight = max(1, max_workers * 2)
+        # Не больше числа потоков: «в работе» = реально исполняемые задачи, без очереди x2.
+        max_in_flight = max(1, max_workers)
 
         def submit_next():
             while len(in_flight) < max_in_flight:

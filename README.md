@@ -1,10 +1,10 @@
-# ZSearch v2.1.1
+# ZSearch v2.2.0
 
 Программа для поиска ключевых слов по файлам (PDF, Office, архивы, изображения с OCR).
 
 ## Скачать актуальную версию
 
-**[Скачать ZSearch.exe (v2.1.1)](https://github.com/DrunkDr8am/poiskV4/raw/before-access/releases/ZSearch.exe)**
+**[Скачать ZSearch.exe (v2.2.0)](https://github.com/DrunkDr8am/poiskV4/raw/before-access/releases/ZSearch.exe)**
 
 Пароль при запуске: `1511`
 
