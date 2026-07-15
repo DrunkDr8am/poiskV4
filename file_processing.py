@@ -39,9 +39,6 @@ _OCR_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ocr_
 _ocr_memory_cache: Dict[str, str] = {}
 _ocr_memory_cache_lock = threading.Lock()
 _OCR_MEMORY_CACHE_MAX = 256
-_ocr_semaphore: Optional[threading.Semaphore] = None
-_ocr_semaphore_limit = 0
-_ocr_semaphore_lock = threading.Lock()
 
 
 def _make_ocr_cache_key(*parts) -> str:
@@ -89,41 +86,13 @@ def ocr_cache_put(cache_key: str, text: str) -> None:
         logging.debug(f"Не удалось сохранить OCR-кэш {cache_key}: {exc}")
 
 
-def _get_ocr_threads_limit(config: dict) -> int:
-    try:
-        ocr_threads = int(config.get('ocr_threads', 2))
-    except (TypeError, ValueError):
-        ocr_threads = 2
-    if ocr_threads <= 0:
-        try:
-            ocr_threads = int(config.get('threads', 1) or 1)
-        except (TypeError, ValueError):
-            ocr_threads = 1
-    return max(1, ocr_threads)
-
-
-def _get_ocr_semaphore(config: dict) -> threading.Semaphore:
-    global _ocr_semaphore, _ocr_semaphore_limit
-    limit = _get_ocr_threads_limit(config)
-    with _ocr_semaphore_lock:
-        if _ocr_semaphore is None or _ocr_semaphore_limit != limit:
-            _ocr_semaphore = threading.Semaphore(limit)
-            _ocr_semaphore_limit = limit
-        return _ocr_semaphore
-
-
 def _execute_ocr(cache_key: str, config: dict, ocr_runner: Callable[[], str]) -> str:
+    """OCR в том же потоке поиска; отдельного лимита OCR-потоков нет."""
     cached_text = ocr_cache_get(cache_key)
     if cached_text is not None:
         return cached_text
 
-    semaphore = _get_ocr_semaphore(config)
-    with semaphore:
-        cached_text = ocr_cache_get(cache_key)
-        if cached_text is not None:
-            return cached_text
-        text = ocr_runner()
-
+    text = ocr_runner()
     ocr_cache_put(cache_key, text)
     return text
 
@@ -134,6 +103,7 @@ def _file_ocr_cache_key(file_path: str, config: dict) -> str:
         os.path.abspath(file_path),
         stat.st_mtime_ns,
         stat.st_size,
+        _ocr_backend_tag(),
         config.get('tesseract_languages', 'rus'),
         config.get('tesseract_config', '--oem 3 --psm 6'),
     )
@@ -144,6 +114,7 @@ def _pil_image_cache_key(pil_img, config: dict, preprocess: bool) -> str:
     pil_img.save(buffer, format='PNG')
     return _make_ocr_cache_key(
         buffer.getvalue(),
+        _ocr_backend_tag(),
         config.get('tesseract_languages', 'rus'),
         config.get('tesseract_config', '--oem 3 --psm 6'),
         preprocess,
@@ -153,6 +124,7 @@ def _pil_image_cache_key(pil_img, config: dict, preprocess: bool) -> str:
 def _pdf_page_cache_key(pdf_path: str, page_index: int, xref: Optional[int], config: dict, mode: str, preprocess: bool) -> str:
     stat = os.stat(pdf_path)
     return _make_ocr_cache_key(
+        _ocr_backend_tag(),
         os.path.abspath(pdf_path),
         stat.st_mtime_ns,
         stat.st_size,
@@ -188,61 +160,27 @@ def _extract_json_from_stdout(stdout_text: str) -> Dict:
         return {}
 
 
-def _normalize_pil_for_ocr(pil_img):
-    """Приводит PIL-изображение к режиму, подходящему для Tesseract."""
-    if pil_img.mode == 'P' and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
-    if pil_img.mode == 'RGBA':
-        pil_img = pil_img.convert('RGB')
-    elif pil_img.mode not in ('RGB', 'L'):
-        pil_img = pil_img.convert('RGB')
-    return pil_img
+def _ocr_backend_tag() -> str:
+    try:
+        from ocr_engine import get_ocr_backend
 
-
-def _prepare_image_for_ocr(pil_img):
-    """Предобработка изображения перед OCR (контраст, градации серого)."""
-    from PIL import ImageOps  # type: ignore
-
-    pil_img = _normalize_pil_for_ocr(pil_img)
-    gray = pil_img.convert('L')
-    return ImageOps.autocontrast(gray)
-
-
-def _pdf_ocr_languages(ocr_lang: str) -> str:
-    """Для PDF-сканов добавляет eng к rus, если ещё не указан."""
-    lang = (ocr_lang or "rus").strip() or "rus"
-    parts = [part.strip() for part in lang.split('+') if part.strip()]
-    if 'rus' in parts and 'eng' not in parts:
-        parts.append('eng')
-    return '+'.join(parts) if parts else 'rus+eng'
-
-
-def _ocr_pil_image(pil_img, pytesseract, ocr_lang: str, ocr_cfg: str, preprocess: bool = True) -> str:
-    """Распознаёт текст на PIL-изображении."""
-    if preprocess:
-        pil_img = _prepare_image_for_ocr(pil_img)
-    else:
-        pil_img = _normalize_pil_for_ocr(pil_img)
-    return pytesseract.image_to_string(
-        pil_img,
-        lang=_pdf_ocr_languages(ocr_lang),
-        config=ocr_cfg or PDF_OCR_TESSERACT_CONFIG,
-    )
+        return get_ocr_backend() or "none"
+    except Exception:
+        return "none"
 
 
 def _ocr_pil_image_cached(
     pil_img,
-    pytesseract,
     config: dict,
     preprocess: bool = True,
     cache_key: Optional[str] = None,
 ) -> str:
-    ocr_lang = config.get('tesseract_languages', 'rus')
-    ocr_cfg = config.get('tesseract_config', '--oem 3 --psm 6')
+    from ocr_engine import ocr_pil_image
+
     resolved_cache_key = cache_key or _pil_image_cache_key(pil_img, config, preprocess)
 
     def run_ocr() -> str:
-        return _ocr_pil_image(pil_img, pytesseract, ocr_lang, ocr_cfg, preprocess)
+        return ocr_pil_image(pil_img, config=config, preprocess=preprocess)
 
     return _execute_ocr(resolved_cache_key, config, run_ocr)
 
@@ -268,8 +206,10 @@ def _extract_embedded_pdf_image(doc, xref: int, Image):
     return background
 
 
-def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config: dict, pdf_path: str, page_index: int) -> str:
+def _ocr_pdf_page_pixmap(page, fitz_module, Image, config: dict, pdf_path: str, page_index: int) -> str:
     """OCR всей страницы PDF как растрового изображения."""
+    from ocr_engine import ocr_pil_image
+
     cache_key = _pdf_page_cache_key(pdf_path, page_index, None, config, 'pixmap', True)
 
     def run_ocr() -> str:
@@ -280,22 +220,16 @@ def _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config: dict, pd
             if pix.width <= 0 or pix.height <= 0:
                 return ""
             pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            return _ocr_pil_image(
-                pil_img,
-                pytesseract,
-                config.get('tesseract_languages', 'rus'),
-                config.get('tesseract_config', '--oem 3 --psm 6'),
-                True,
-            )
+            return ocr_pil_image(pil_img, config=config, preprocess=True)
         except Exception:
             return ""
 
     return _execute_ocr(cache_key, config, run_ocr)
 
 
-def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, config: dict, pdf_path: str, page_index: int) -> str:
+def _ocr_pdf_scanned_page(page, doc, fitz_module, Image, config: dict, pdf_path: str, page_index: int) -> str:
     """OCR страницы-скана: растеризация страницы даёт лучший результат, чем smask-изображения."""
-    page_text = _ocr_pdf_page_pixmap(page, fitz_module, pytesseract, Image, config, pdf_path, page_index)
+    page_text = _ocr_pdf_page_pixmap(page, fitz_module, Image, config, pdf_path, page_index)
     if (page_text or "").strip():
         return page_text
 
@@ -307,7 +241,7 @@ def _ocr_pdf_scanned_page(page, doc, fitz_module, pytesseract, Image, config: di
             if pil_img is None:
                 continue
             cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', True)
-            embedded_text = _ocr_pil_image_cached(pil_img, pytesseract, config, True, cache_key)
+            embedded_text = _ocr_pil_image_cached(pil_img, config, True, cache_key)
             if embedded_text:
                 ocr_chunks.append(embedded_text)
         except Exception:
@@ -326,15 +260,14 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
         max_pages = int(config.get('max_pdf_pages', 0) or 0)
         has_ocr = bool(config.get('has_ocr', False))
         ocr_ready = False
-        pytesseract = None
         Image = None
         if has_ocr:
             try:
-                import pytesseract as _pytesseract  # type: ignore
                 from PIL import Image as _Image  # type: ignore
-                pytesseract = _pytesseract
+                from ocr_engine import setup_ocr
+
                 Image = _Image
-                ocr_ready = True
+                ocr_ready = bool(setup_ocr())
             except Exception:
                 ocr_ready = False
 
@@ -353,7 +286,7 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
             page_text_empty = not (text or "").strip()
             if page_text_empty:
                 ocr_text = _ocr_pdf_scanned_page(
-                    page, doc, fitz, pytesseract, Image, config, pdf_path, page_index
+                    page, doc, fitz, Image, config, pdf_path, page_index
                 )
                 found.update(_search_in_ocr_text(ocr_text, keywords_words, keywords_substr))
             else:
@@ -365,7 +298,7 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
                             continue
                         cache_key = _pdf_page_cache_key(pdf_path, page_index, xref, config, 'embedded', False)
                         ocr_text = _ocr_pil_image_cached(
-                            pil_img, pytesseract, config, False, cache_key
+                            pil_img, config, False, cache_key
                         )
                         found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
                         if keywords_all and found.issuperset(keywords_all):
@@ -436,8 +369,8 @@ def run_pdf_worker_cli(argv: List[str]) -> int:
 
     if config.get("has_ocr", False):
         try:
-            from tesseract_setup import setup_tesseract
-            setup_tesseract()
+            from ocr_engine import setup_ocr
+            setup_ocr()
         except Exception:
             pass
 
@@ -752,15 +685,18 @@ def extract_best_effort_text(file_path: str) -> str:
 
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
-    """Распознавание текста с изображения"""
+    """Распознавание текста с изображения (RapidOCR / Tesseract)."""
     if not config.get('has_ocr', False):
         return set()
 
     try:
         from PIL import Image
-        import pytesseract
+        from ocr_engine import setup_ocr
     except ImportError:
-        logging.warning("Модули для OCR (Pillow/pytesseract) не установлены. Пропуск изображения.")
+        logging.warning("Модули для OCR (Pillow/ocr_engine) не установлены. Пропуск изображения.")
+        return set()
+
+    if not setup_ocr():
         return set()
 
     try:
@@ -781,7 +717,7 @@ def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
         elif img.mode not in ('RGB', 'L'):
             img = img.convert('RGB')
 
-        text = _ocr_pil_image_cached(img, pytesseract, config, False, cache_key)
+        text = _ocr_pil_image_cached(img, config, False, cache_key)
         return search_in_text(text)
     except Exception as e:
         logging.error(f"Ошибка обработки изображения {image_data}: {e}")
@@ -801,13 +737,13 @@ def _hidden_subprocess_kwargs() -> dict:
     return kwargs
 
 
-def _ensure_tesseract_for_pdf(config: dict) -> None:
-    """Настраивает Tesseract перед обработкой PDF в текущем процессе."""
+def _ensure_ocr_for_pdf(config: dict) -> None:
+    """Инициализирует OCR перед обработкой PDF в текущем процессе."""
     if not config.get("has_ocr", False):
         return
     try:
-        from tesseract_setup import setup_tesseract
-        setup_tesseract()
+        from ocr_engine import setup_ocr
+        setup_ocr()
     except Exception:
         pass
 
@@ -819,9 +755,8 @@ def _search_in_pdf_inprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
-        "ocr_threads": _get_ocr_threads_limit(config),
     }
-    _ensure_tesseract_for_pdf(payload_config)
+    _ensure_ocr_for_pdf(payload_config)
     try:
         return _search_in_pdf_core(
             pdf_path,
@@ -842,7 +777,6 @@ def _search_in_pdf_subprocess(pdf_path: str, config: dict) -> Set[str]:
         "has_ocr": bool(config.get("has_ocr", False)),
         "tesseract_languages": config.get("tesseract_languages", "rus"),
         "tesseract_config": config.get("tesseract_config", "--oem 3 --psm 6"),
-        "ocr_threads": _get_ocr_threads_limit(config),
     }
 
     worker_args = [

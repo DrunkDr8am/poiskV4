@@ -23,9 +23,16 @@ def _safe_getint(config, section, option, fallback):
         return fallback
 
 
+def _default_threads_count():
+    """Потоки поиска по умолчанию от числа ядер CPU."""
+    cpu_count = os.cpu_count() or 1
+    return cpu_count - 2 if cpu_count > 2 else 1
+
+
 def load_config(config_file="config.txt"):
     """Загрузка конфигурации из файла"""
     config = configparser.ConfigParser()
+    default_threads = _default_threads_count()
 
     # Значения по умолчанию
     defaults = {
@@ -35,8 +42,7 @@ def load_config(config_file="config.txt"):
         'directory': '.',
         'theme': 'Светлая',
         'pre_count_files': 'true',
-        'threads': '4',
-        'ocr_threads': '2',
+        'threads': str(default_threads),
         'output_file': 'search_results.txt',
         'search_images': 'false',
         'max_file_size': '50',
@@ -69,7 +75,6 @@ def load_config(config_file="config.txt"):
     theme = config.get('Settings', 'theme', fallback=defaults['theme'])
     pre_count_files = config.getboolean('Settings', 'pre_count_files', fallback=True)
     threads = _safe_getint(config, 'Settings', 'threads', int(defaults['threads']))
-    ocr_threads = _safe_getint(config, 'Settings', 'ocr_threads', int(defaults['ocr_threads']))
     output_file = config.get('Settings', 'output_file', fallback=defaults['output_file'])
     search_images = config.getboolean('Settings', 'search_images', fallback=False)
     max_file_size = _safe_getint(config, 'Settings', 'max_file_size', int(defaults['max_file_size']))
@@ -104,7 +109,6 @@ def load_config(config_file="config.txt"):
         'theme': theme,
         'pre_count_files': pre_count_files,
         'threads': threads,
-        'ocr_threads': ocr_threads,
         'output_file': output_file,
         'search_images': search_images,
         'max_file_size': max_file_size,
@@ -117,7 +121,8 @@ def load_config(config_file="config.txt"):
 
 def create_default_config():
     """Создание файла конфигурации по умолчанию"""
-    config_content = """[Settings]
+    default_threads = _default_threads_count()
+    config_content = f"""[Settings]
 # Расширения файлов для поиска (через запятую)
 extensions = *.txt, *.pdf, *.doc, *.docx, *.docm, *.dot, *.dotx, *.dotm, *.xls, *.xlsx, *.xlsm, *.xlt, *.xltx, *.xltm, *.jpg, *.jpeg, *.jpe, *.jfif, *.png, *.bmp, *.gif, *.tif, *.tiff, *.webp, *.ico, *.zip, *.rar, *.7z
 
@@ -137,10 +142,7 @@ theme = Светлая
 pre_count_files = true
 
 # Количество потоков для обработки
-threads = 4
-
-# Количество параллельных OCR-потоков (Tesseract)
-ocr_threads = 2
+threads = {default_threads}
 
 # Файл для сохранения результатов
 output_file = search_results.txt

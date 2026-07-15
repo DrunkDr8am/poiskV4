@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover - крайне редкий случай для стандартного Python
     sqlite3 = None
 from config_loader import load_config, create_default_config
-from tesseract_setup import setup_tesseract
+from ocr_engine import setup_ocr, get_ocr_backend
 from file_processing import load_keywords, run_pdf_worker_cli, ARCHIVE_MEMBER_SEP
 from search_engine import search_files, collect_matching_files, PRECOUNT_PROGRESS_INTERVAL
 from configparser import ConfigParser
@@ -39,6 +39,7 @@ CRASH_LOG_FILE = "crash_log.txt"
 SEARCH_STATE_DB_FILE = "search_state.db"
 SEARCH_STATE_VERSION = 1
 CANDIDATE_FILES_BATCH_SIZE = 2000
+SEARCH_UI_UPDATE_INTERVAL_MS = 200
 
 
 def write_crash_report(error_title, exc_value, exc_traceback):
@@ -84,7 +85,6 @@ class SearchApp:
         self.is_closing = False
         self.config_dirty = False
         self._updating_threads_var = False
-        self._updating_ocr_threads_var = False
         self.invalid_password_timer_id = None
         self.invalid_password_deadline_ms = None
         self.search_file_handler = None
@@ -97,6 +97,10 @@ class SearchApp:
         self._reset_processed_files_table = False
         self._saved_processed_count = 0
         self._unsaved_processed_paths = []
+        self._pending_progress_update = None
+        self._progress_update_scheduled = False
+        self._dashboard_update_scheduled = False
+        self._ui_update_lock = threading.Lock()
         self.resume_paths_pending_load = False
         self.resume_start_count = 0
         self.search_session_status_var = tk.StringVar(value="Статус сессии: нет данных")
@@ -162,12 +166,6 @@ class SearchApp:
         return cpu_count - 2 if cpu_count > 2 else 1
 
     @staticmethod
-    def get_default_ocr_threads_count():
-        """Рекомендуемое число OCR-потоков: 2 или меньше при слабом CPU."""
-        cpu_count = os.cpu_count() or 1
-        return min(2, max(1, cpu_count))
-
-    @staticmethod
     def get_max_threads_count():
         """Максимально допустимое количество потоков на текущем компьютере."""
         return max(1, os.cpu_count() or 1)
@@ -182,47 +180,6 @@ class SearchApp:
         threads = max(1, min(threads, max_threads))
         self.threads_var.set(str(threads))
         return threads
-
-    def normalize_ocr_threads_value(self, for_runtime=False):
-        """Нормализует OCR-потоки. 0 в настройках = столько же, сколько потоков поиска."""
-        max_threads = self.get_max_threads_count()
-        try:
-            ocr_threads = int(self.ocr_threads_var.get())
-        except (TypeError, ValueError):
-            ocr_threads = 0
-
-        if for_runtime:
-            if ocr_threads <= 0:
-                return self.normalize_threads_value()
-            return max(1, min(ocr_threads, max_threads))
-
-        ocr_threads = max(0, min(ocr_threads, max_threads))
-        self.ocr_threads_var.set(str(ocr_threads))
-        return ocr_threads
-
-    def on_ocr_threads_var_change(self, *_args):
-        """Не дает вручную ввести число OCR-потоков больше доступного."""
-        if self._updating_ocr_threads_var:
-            return
-
-        value = self.ocr_threads_var.get()
-        if value == "":
-            return
-
-        filtered = "".join(ch for ch in value if ch.isdigit())
-        max_threads = self.get_max_threads_count()
-
-        if not filtered:
-            new_value = "0"
-        else:
-            new_value = str(min(max(0, int(filtered)), max_threads))
-
-        if new_value != value:
-            self._updating_ocr_threads_var = True
-            try:
-                self.ocr_threads_var.set(new_value)
-            finally:
-                self._updating_ocr_threads_var = False
 
     def on_threads_var_change(self, *_args):
         """Не дает вручную ввести число потоков больше доступного."""
@@ -307,8 +264,10 @@ class SearchApp:
         except ImportError:
             logging.warning("Модуль rarfile не установлен. Поддержка RAR архивов отключена.")
 
-        # Tesseract настраивается отдельно
-        HAS_OCR = setup_tesseract()
+        # OCR: RapidOCR (основной), Tesseract (fallback)
+        HAS_OCR = setup_ocr()
+        if HAS_OCR:
+            logging.info(f"OCR backend: {get_ocr_backend()}")
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -503,40 +462,31 @@ class SearchApp:
         )
         threads_spin.grid(row=2, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="OCR-потоки (Tesseract, 0=как потоки поиска):").grid(row=3, column=0, sticky=tk.W, pady=3)
-        default_ocr_threads = str(self.config['config'].get('ocr_threads', self.get_default_ocr_threads_count()))
-        self.ocr_threads_var = tk.StringVar(value=default_ocr_threads)
-        self.ocr_threads_var.trace_add("write", self.on_ocr_threads_var_change)
-        ocr_threads_spin = ttk.Spinbox(
-            settings_tab, from_=0, to=self.get_max_threads_count(), textvariable=self.ocr_threads_var, width=8
-        )
-        ocr_threads_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
-
-        ttk.Label(settings_tab, text="Макс. размер файла (МБ, 0=без лимита):").grid(row=4, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. размер файла (МБ, 0=без лимита):").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.max_size_var = tk.StringVar(value=str(self.config['config'].get('max_file_size', 50)))
         max_size_spin = ttk.Spinbox(settings_tab, from_=0, to=1000, textvariable=self.max_size_var, width=8)
-        max_size_spin.grid(row=4, column=1, sticky=tk.W, pady=3)
+        max_size_spin.grid(row=3, column=1, sticky=tk.W, pady=3)
 
         self.search_images_var = tk.BooleanVar(value=self.config['config'].get('search_images', False))
-        ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=5, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Поиск по изображениям (OCR):").grid(row=4, column=0, sticky=tk.W, pady=3)
         ttk.Checkbutton(settings_tab, text="Включить OCR", variable=self.search_images_var).grid(
-            row=5, column=1, sticky=tk.W, pady=3
+            row=4, column=1, sticky=tk.W, pady=3
         )
 
-        ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. страниц PDF (0=без лимита):").grid(row=5, column=0, sticky=tk.W, pady=3)
         self.max_pdf_pages_var = tk.StringVar(value=str(self.config['config'].get('max_pdf_pages', 0)))
         max_pdf_pages_spin = ttk.Spinbox(settings_tab, from_=0, to=100000, textvariable=self.max_pdf_pages_var, width=10)
-        max_pdf_pages_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
+        max_pdf_pages_spin.grid(row=5, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=7, column=0, sticky=tk.W, pady=3)
+        ttk.Label(settings_tab, text="Макс. длина пути (0=без лимита):").grid(row=6, column=0, sticky=tk.W, pady=3)
         self.max_path_length_var = tk.StringVar(value=str(self.config['config'].get('max_path_length', 240)))
         max_path_spin = ttk.Spinbox(settings_tab, from_=0, to=10000, textvariable=self.max_path_length_var, width=10)
-        max_path_spin.grid(row=7, column=1, sticky=tk.W, pady=3)
+        max_path_spin.grid(row=6, column=1, sticky=tk.W, pady=3)
 
-        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=8, column=0, sticky=tk.NW, pady=(8, 3))
+        ttk.Label(settings_tab, text="Режим запуска поиска:").grid(row=7, column=0, sticky=tk.NW, pady=(8, 3))
         self.pre_count_files_var = tk.BooleanVar(value=bool(self.config['config'].get('pre_count_files', True)))
         launch_mode_frame = ttk.Frame(settings_tab)
-        launch_mode_frame.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
+        launch_mode_frame.grid(row=7, column=1, sticky=tk.W, pady=(8, 3))
         ttk.Radiobutton(
             launch_mode_frame,
             text="Сначала считать файлы, затем искать",
@@ -550,21 +500,21 @@ class SearchApp:
             value=False
         ).grid(row=1, column=0, sticky=tk.W)
 
-        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=9, column=0, sticky=tk.W, pady=(8, 3))
+        ttk.Label(settings_tab, text="Тема интерфейса:").grid(row=8, column=0, sticky=tk.W, pady=(8, 3))
         self.theme_toggle_button = ttk.Button(settings_tab, text="", command=self.toggle_theme, width=14)
-        self.theme_toggle_button.grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
+        self.theme_toggle_button.grid(row=8, column=1, sticky=tk.W, pady=(8, 3))
 
         ttk.Button(
             settings_tab,
             text="Сбросить состояние поиска",
             command=self.reset_search_state
-        ).grid(row=10, column=1, sticky=tk.W, pady=(8, 3))
+        ).grid(row=9, column=1, sticky=tk.W, pady=(8, 3))
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.0.9 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.1.0 | Автор: Андрей ОБИС 2026"
         )
-        footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
+        footer_info.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
         self.setup_logging()
         self.apply_theme(self.theme_var.get())
@@ -1201,8 +1151,22 @@ class SearchApp:
             self.save_search_state()
             with self.search_state_lock:
                 self._pending_state_updates = 0
-        self.safe_after(0, self.refresh_search_session_ui)
-        self.safe_after(0, self.update_dashboard_labels)
+            self.safe_after(0, self.refresh_search_session_ui)
+        else:
+            self._request_dashboard_update()
+
+    def _request_dashboard_update(self):
+        """Планирует редкое обновление дашборда, чтобы не перегружать Tkinter."""
+        with self._ui_update_lock:
+            if self._dashboard_update_scheduled:
+                return
+            self._dashboard_update_scheduled = True
+        self.safe_after(SEARCH_UI_UPDATE_INTERVAL_MS, self._flush_dashboard_update)
+
+    def _flush_dashboard_update(self):
+        with self._ui_update_lock:
+            self._dashboard_update_scheduled = False
+        self.update_dashboard_labels()
 
     def finalize_search_state(self, status, error_text=""):
         """Фиксирует финальный статус сессии поиска."""
@@ -1426,9 +1390,6 @@ class SearchApp:
                 else:
                     status_text += f" | {file_name}"
             self.current_file.set(status_text)
-
-        # Принудительно обновляем прогрессбар
-        self.progress_bar.update_idletasks()
 
     def add_live_result(self, file_path, keywords):
         """Добавление найденного результата в таблицу в реальном времени."""
@@ -1818,7 +1779,6 @@ class SearchApp:
         self.config['config']['has_7z'] = HAS_7Z
         self.config['config']['has_rar'] = HAS_RAR
         self.config['config']['has_ocr'] = HAS_OCR
-        self.config['config']['ocr_threads'] = self.normalize_ocr_threads_value(for_runtime=True)
 
         try:
             self.ensure_search_file_logging('search_log.txt')
@@ -1881,7 +1841,6 @@ class SearchApp:
         # Автоматически выставляем потоки по формуле: max_cpu-2, иначе 1
         self.threads_var.set(str(self.get_auto_threads_count()))
         self.normalize_threads_value()
-        self.normalize_ocr_threads_value()
 
         extensions = self.get_selected_extensions()
 
@@ -2166,8 +2125,24 @@ class SearchApp:
             self.safe_after(0, self.on_search_finished)
 
     def update_progress_callback(self, file_name, processed_count, in_flight=None):
-        """Callback для обновления прогресса из search_engine"""
-        self.safe_after(0, self._update_progress_in_main_thread, file_name, processed_count, in_flight)
+        """Callback из search_engine: буферизует частые события прогресса."""
+        with self._ui_update_lock:
+            self._pending_progress_update = (file_name, processed_count, in_flight)
+            if self._progress_update_scheduled:
+                return
+            self._progress_update_scheduled = True
+        self.safe_after(SEARCH_UI_UPDATE_INTERVAL_MS, self._flush_progress_update)
+
+    def _flush_progress_update(self):
+        """Применяет последнее накопленное обновление прогресса в UI-потоке."""
+        with self._ui_update_lock:
+            payload = self._pending_progress_update
+            self._pending_progress_update = None
+            self._progress_update_scheduled = False
+        if payload is None:
+            return
+        file_name, processed_count, in_flight = payload
+        self._update_progress_in_main_thread(file_name, processed_count, in_flight)
 
     def _update_progress_in_main_thread(self, file_name, processed_count, in_flight=None):
         """Обновление прогресса в основном потоке"""
@@ -2178,6 +2153,10 @@ class SearchApp:
 
     def on_search_finished(self):
         """Вызывается при завершении поиска"""
+        with self._ui_update_lock:
+            self._pending_progress_update = None
+            self._progress_update_scheduled = False
+            self._dashboard_update_scheduled = False
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
         self.search_in_flight_count = 0
@@ -2197,7 +2176,6 @@ class SearchApp:
 
         current_cfg = self.config['config']
         threads_count = self.normalize_threads_value()
-        ocr_threads_count = self.normalize_ocr_threads_value()
         max_size_to_save = str(self.max_size_var.get()).strip() or "0"
         max_path_to_save = str(self.max_path_length_var.get()).strip() or "0"
 
@@ -2210,7 +2188,6 @@ class SearchApp:
             'theme': self.theme_var.get(),
             'pre_count_files': 'true' if self.pre_count_files_var.get() else 'false',
             'threads': str(threads_count),
-            'ocr_threads': str(ocr_threads_count),
             'output_file': current_cfg.get('output_file', 'search_results.txt'),
             'search_images': 'true' if self.search_images_var.get() else 'false',
             'max_file_size': max_size_to_save,
