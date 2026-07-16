@@ -100,18 +100,9 @@ def _wait_if_paused(is_paused_func: callable = None, is_searching_func: callable
 def _process_file_with_start(file_path: str, extensions: List[str], max_file_size: int, config: dict,
                              progress_callback: callable = None, is_searching_func: callable = None,
                              is_paused_func: callable = None):
-    """Обертка для отправки статуса старта обработки файла."""
+    """Обертка с проверкой паузы/остановки перед обработкой файла."""
     if is_searching_func and not is_searching_func():
         return {}
-
-    if not _wait_if_paused(is_paused_func, is_searching_func):
-        return {}
-
-    if progress_callback and callable(progress_callback):
-        try:
-            progress_callback(f"Начат: {os.path.basename(file_path)}", None)
-        except Exception as e:
-            logging.error(f"Ошибка в callback старта обработки: {e}")
 
     if not _wait_if_paused(is_paused_func, is_searching_func):
         return {}
@@ -212,6 +203,16 @@ def search_files(root_dir: str, extensions: List[str], max_workers: int = 4, out
                     is_paused_func
                 )
                 in_flight[future] = file_path
+                # «Взятый в работу» — момент постановки в пул, не завершения воркера.
+                if progress_callback and callable(progress_callback):
+                    try:
+                        progress_callback(
+                            f"Начат: {os.path.basename(file_path)}",
+                            None,
+                            len(in_flight),
+                        )
+                    except Exception as e:
+                        logging.error(f"Ошибка в callback старта обработки: {e}")
 
         submit_next()
 

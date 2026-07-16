@@ -115,39 +115,54 @@ def _ocr_pdf_page_pixmap(page, fitz_module, Image, config: dict, pdf_path: str, 
         return ""
 
 
-def _ocr_pdf_scanned_page(page, doc, fitz_module, Image, config: dict, pdf_path: str, page_index: int) -> str:
-    """OCR страницы-скана: растеризация страницы даёт лучший результат, чем smask-изображения."""
-    page_text = _ocr_pdf_page_pixmap(page, fitz_module, Image, config, pdf_path, page_index)
-    if (page_text or "").strip():
-        return page_text
-
+def _ocr_pdf_page_images(
+    page,
+    doc,
+    Image,
+    config: dict,
+    preprocess: bool = False,
+    xref_cache: Optional[Dict[int, str]] = None,
+) -> str:
+    """OCR встроенных изображений страницы; xref_cache дедуплицирует OCR внутри одного PDF."""
     ocr_chunks = []
     for img in page.get_images(full=True):
         try:
             xref = img[0]
+            if xref_cache is not None and xref in xref_cache:
+                cached = xref_cache[xref]
+                if cached:
+                    ocr_chunks.append(cached)
+                continue
+
             pil_img = _extract_embedded_pdf_image(doc, xref, Image)
             if pil_img is None:
+                if xref_cache is not None:
+                    xref_cache[xref] = ""
                 continue
-            embedded_text = _ocr_pil_image(pil_img, config, True)
+            embedded_text = _ocr_pil_image(pil_img, config, preprocess) or ""
+            if xref_cache is not None:
+                xref_cache[xref] = embedded_text
             if embedded_text:
                 ocr_chunks.append(embedded_text)
         except Exception:
             continue
-
     return "\n".join(ocr_chunks)
 
 
 def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], keywords_substr: Set[str],
                         keywords_all: Set[str]) -> Set[str]:
-    """Базовая логика поиска в PDF (используется worker-ом и fallback-режимом)."""
+    """Поиск в PDF в пределах max_pdf_pages: текст + картинки страницы (без двойного OCR на сканах)."""
     found = set()
     import fitz  # type: ignore
 
     with fitz.open(pdf_path) as doc:
         max_pages = int(config.get('max_pdf_pages', 0) or 0)
+        # 0 = без лимита; иначе строго первые max_pages страниц (1..N в UI → индексы 0..N-1).
+        page_limit = doc.page_count if max_pages <= 0 else min(doc.page_count, max_pages)
         has_ocr = bool(config.get('has_ocr', False))
         ocr_ready = False
         Image = None
+        xref_ocr_cache: Dict[int, str] = {}
         if has_ocr:
             try:
                 from PIL import Image as _Image  # type: ignore
@@ -158,10 +173,8 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
             except Exception:
                 ocr_ready = False
 
-        for page_index, page in enumerate(doc):
-            if max_pages > 0 and page_index >= max_pages:
-                break
-
+        for page_index in range(page_limit):
+            page = doc[page_index]
             text = page.get_text()
             found.update(_search_in_text_worker(text, keywords_words, keywords_substr))
             if keywords_all and found.issuperset(keywords_all):
@@ -172,23 +185,25 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
 
             page_text_empty = not (text or "").strip()
             if page_text_empty:
-                ocr_text = _ocr_pdf_scanned_page(
-                    page, doc, fitz, Image, config, pdf_path, page_index
+                # Скан: OCR всей страницы покрывает видимый контент (включая картинки).
+                page_ocr = _ocr_pdf_page_pixmap(
+                    page, fitz, Image, config, pdf_path, page_index
                 )
-                found.update(_search_in_ocr_text(ocr_text, keywords_words, keywords_substr))
+                found.update(_search_in_ocr_text(page_ocr, keywords_words, keywords_substr))
+                # Fallback: если растеризация ничего не дала — OCR встроенных картинок страницы.
+                if not (page_ocr or "").strip():
+                    images_ocr = _ocr_pdf_page_images(
+                        page, doc, Image, config, preprocess=True, xref_cache=xref_ocr_cache
+                    )
+                    if images_ocr:
+                        found.update(_search_in_ocr_text(images_ocr, keywords_words, keywords_substr))
             else:
-                for img in page.get_images(full=True):
-                    try:
-                        xref = img[0]
-                        pil_img = _extract_embedded_pdf_image(doc, xref, Image)
-                        if pil_img is None:
-                            continue
-                        ocr_text = _ocr_pil_image(pil_img, config, False)
-                        found.update(_search_in_text_worker(ocr_text, keywords_words, keywords_substr))
-                        if keywords_all and found.issuperset(keywords_all):
-                            break
-                    except Exception:
-                        continue
+                # Текстовая страница: OCR только картинок этой страницы.
+                images_ocr = _ocr_pdf_page_images(
+                    page, doc, Image, config, preprocess=False, xref_cache=xref_ocr_cache
+                )
+                if images_ocr:
+                    found.update(_search_in_ocr_text(images_ocr, keywords_words, keywords_substr))
 
             if keywords_all and found.issuperset(keywords_all):
                 break

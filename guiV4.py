@@ -127,6 +127,7 @@ class SearchApp:
         self.total_files = 0
         self.processed_files = 0
         self.search_in_flight_count = 0
+        self.last_started_file = ""
         self.search_start_time = None  # Время начала поиска
         self.search_end_time = None  # Время окончания поиска
         self.max_result_file_text_px = 0
@@ -550,7 +551,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.2.0 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.3.0 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -1370,70 +1371,58 @@ class SearchApp:
         self.progress_value.set(0)
         self.current_file.set("")
         self.processed_files = 0
+        self.last_started_file = ""
+        self.search_in_flight_count = 0
 
     def update_progress(self, file_name="", in_flight=None):
-        """Обновление прогресса с информацией о прогрессе"""
+        """Обновление прогресса: счётчик + последний взятый в работу файл."""
         if in_flight is not None:
             self.search_in_flight_count = max(0, int(in_flight))
 
+        if file_name:
+            if file_name.startswith("Начат:"):
+                self.last_started_file = file_name.replace("Начат:", "", 1).strip()
+            elif file_name.startswith("Подсчёт файлов:"):
+                self.current_file.set(file_name)
+                return
+            elif file_name == "Поиск завершен":
+                if self.total_files > 0:
+                    self.processed_files = self.total_files
+                    self.progress_value.set(100)
+                    self.current_file.set(
+                        f"Поиск завершен! Обработано: {self.processed_files}/{self.total_files} файлов"
+                    )
+                else:
+                    self.progress_value.set(100)
+                    self.current_file.set(
+                        f"Поиск завершен! Обработано файлов: {self.processed_files}"
+                    )
+                return
+
         logging.debug(
             f"Updating progress: {self.processed_files}/{self.total_files}, "
-            f"file: {file_name}, in_flight: {self.search_in_flight_count}"
+            f"file: {self.last_started_file}, in_flight: {self.search_in_flight_count}"
         )
 
         if self.total_files > 0:
             progress = (self.processed_files / self.total_files) * 100
             self.progress_value.set(progress)
-
             progress_text = f"Обработано: {self.processed_files}/{self.total_files} файлов"
-            if self.search_in_flight_count > 0:
-                progress_text += f" | в работе: {self.search_in_flight_count}"
-
-            if file_name:
-                display_name = file_name
-                if len(file_name) > 50:
-                    display_name = "..." + file_name[-47:]
-
-                if file_name.startswith("Завершена обработка:"):
-                    progress_text += f" | {file_name}"
-                elif file_name.startswith("Начат:"):
-                    progress_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
-                elif file_name.startswith("Подготовка:"):
-                    progress_text += f" | {file_name}"
-                elif file_name.startswith("Подсчёт файлов:"):
-                    progress_text = file_name
-                elif file_name.startswith("Запуск поиска:"):
-                    progress_text += f" | {file_name}"
-                elif file_name.startswith("Готово:"):
-                    progress_text += f" | {file_name}"
-                elif file_name == "Поиск завершен":
-                    # В конце поиска всегда показываем полный прогресс.
-                    self.processed_files = self.total_files
-                    self.progress_value.set(100)
-                    progress_text = (
-                        f"Поиск завершен! Обработано: {self.processed_files}/{self.total_files} файлов"
-                    )
-                else:
-                    progress_text += f" | {display_name}"
-
-            self.current_file.set(progress_text)
         else:
-            status_text = f"Обработано: {self.processed_files} файлов"
-            if self.search_in_flight_count > 0:
-                status_text += f" | в работе: {self.search_in_flight_count}"
-            if file_name:
-                if file_name.startswith("Завершена обработка:"):
-                    status_text += f" | {file_name}"
-                elif file_name.startswith("Начат:"):
-                    status_text += f" | {file_name.replace('Начат:', 'Текущий:', 1)}"
-                elif file_name.startswith("Готово:"):
-                    status_text += f" | {file_name}"
-                elif file_name == "Поиск завершен":
-                    self.progress_value.set(100)
-                    status_text = f"Поиск завершен! Обработано файлов: {self.processed_files}"
-                else:
-                    status_text += f" | {file_name}"
-            self.current_file.set(status_text)
+            progress_text = f"Обработано: {self.processed_files} файлов"
+
+        if self.search_in_flight_count > 0:
+            progress_text += f" | в работе: {self.search_in_flight_count}"
+
+        if self.last_started_file:
+            display_name = self.last_started_file
+            if len(display_name) > 50:
+                display_name = "..." + display_name[-47:]
+            progress_text += f" | Текущий: {display_name}"
+        elif file_name and file_name.startswith(("Подготовка:", "Запуск поиска:")):
+            progress_text += f" | {file_name}"
+
+        self.current_file.set(progress_text)
 
     def add_live_result(self, file_path, keywords):
         """Добавление найденного результата в таблицу в реальном времени."""
@@ -1844,6 +1833,7 @@ class SearchApp:
         self.is_paused = False
         self.processed_files = self.resume_start_count
         self.search_in_flight_count = 0
+        self.last_started_file = ""
 
         use_determinate_progress = bool(
             pre_count_enabled or (resume_state is not None and self.total_files > 0)
@@ -2173,13 +2163,33 @@ class SearchApp:
             self.safe_after(0, self.on_search_finished)
 
     def update_progress_callback(self, file_name, processed_count, in_flight=None):
-        """Callback из search_engine: буферизует частые события прогресса."""
+        """Callback из search_engine: не теряет счётчик при coalescing; завершённые — сразу."""
+        is_completion = isinstance(processed_count, int)
         with self._ui_update_lock:
-            self._pending_progress_update = (file_name, processed_count, in_flight)
+            prev = self._pending_progress_update
+            merged_name = file_name
+            merged_count = processed_count
+            merged_inflight = in_flight
+            if prev is not None:
+                prev_name, prev_count, prev_inflight = prev
+                # Счётчик только растёт — «Начат» с None не должен затирать «Готово».
+                if not isinstance(merged_count, int) and isinstance(prev_count, int):
+                    merged_count = prev_count
+                elif isinstance(merged_count, int) and isinstance(prev_count, int):
+                    merged_count = max(merged_count, prev_count)
+                if merged_inflight is None:
+                    merged_inflight = prev_inflight
+                # Имя текущего файла берём из последнего «Начат», иначе оставляем прежнее.
+                if not (merged_name and str(merged_name).startswith("Начат:")):
+                    if prev_name and str(prev_name).startswith("Начат:"):
+                        merged_name = prev_name
+            self._pending_progress_update = (merged_name, merged_count, merged_inflight)
             if self._progress_update_scheduled:
                 return
             self._progress_update_scheduled = True
-        self.safe_after(SEARCH_UI_UPDATE_INTERVAL_MS, self._flush_progress_update)
+        # После каждого проверенного файла обновляем UI сразу; «Начат» можно чуть сгладить.
+        delay = 0 if is_completion else SEARCH_UI_UPDATE_INTERVAL_MS
+        self.safe_after(delay, self._flush_progress_update)
 
     def _flush_progress_update(self):
         """Применяет последнее накопленное обновление прогресса в UI-потоке."""
@@ -2215,6 +2225,7 @@ class SearchApp:
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
         self.search_in_flight_count = 0
+        self.last_started_file = ""
         self.directory_files_map = {}
 
         search_status = ""
