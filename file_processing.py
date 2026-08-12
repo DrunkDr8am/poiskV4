@@ -30,17 +30,21 @@ PDF_SUBPROCESS_TIMEOUT_SEC = 300
 PDF_OCR_TESSERACT_CONFIG = '--oem 3 --psm 3'
 # Качество растеризации PDF для OCR (zoom):
 # high / medium / low / very_low
+# Масштаб растеризации PDF перед OCR (PyMuPDF Matrix zoom).
 PDF_OCR_QUALITY_ZOOM = {
     'high': 2.0,
     'medium': 1.5,
     'low': 1.0,
     'very_low': 0.75,
 }
-PDF_OCR_RENDER_ZOOM = PDF_OCR_QUALITY_ZOOM['medium']
 PDF_OCR_QUALITY_VALUES = frozenset(PDF_OCR_QUALITY_ZOOM)
 WORD_PATTERN = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 XML_TAG_PATTERN = re.compile(rb"<[^>]+>")
 XLSX_EMPTY_ROW_STREAK_LIMIT = 200
+OCR_LATIN_TO_CYRILLIC = str.maketrans({
+    "a": "а", "b": "в", "c": "с", "e": "е", "h": "н", "k": "к",
+    "m": "м", "o": "о", "p": "р", "t": "т", "x": "х", "y": "у",
+})
 
 
 def _pdf_ocr_render_zoom(config: Optional[dict] = None) -> float:
@@ -105,6 +109,8 @@ def _ocr_pdf_page_pixmap(page, fitz_module, Image, config: dict, pdf_path: str, 
     """OCR всей страницы PDF как растрового изображения."""
     try:
         zoom = _pdf_ocr_render_zoom(config)
+        # Tesseract требует достаточного разрешения; zoom < 1.0 ухудшает кириллицу на сканах.
+        zoom = max(1.0, zoom)
         matrix = fitz_module.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         if pix.width <= 0 or pix.height <= 0:
@@ -190,7 +196,6 @@ def _search_in_pdf_core(pdf_path: str, config: dict, keywords_words: Set[str], k
                     page, fitz, Image, config, pdf_path, page_index
                 )
                 found.update(_search_in_ocr_text(page_ocr, keywords_words, keywords_substr))
-                # Fallback: если растеризация ничего не дала — OCR встроенных картинок страницы.
                 if not (page_ocr or "").strip():
                     images_ocr = _ocr_pdf_page_images(
                         page, doc, Image, config, preprocess=True, xref_cache=xref_ocr_cache
@@ -235,6 +240,19 @@ def _search_in_ocr_text(text: str, words: Set[str], substr: Set[str]) -> Set[str
     if not text:
         return found
     text_lower = text.lower()
+    # OCR часто смешивает визуально одинаковые латинские и кириллические
+    # буквы внутри русского слова (например, "Hoрмы"). Исправляем только
+    # смешанные токены, не затрагивая обычный английский текст.
+    def normalize_mixed_script(match) -> str:
+        token = match.group(0)
+        has_latin = bool(re.search(r"[a-z]", token))
+        has_cyrillic = bool(re.search(r"[а-яё]", token))
+        return token.translate(OCR_LATIN_TO_CYRILLIC) if has_latin and has_cyrillic else token
+
+    normalized_text = WORD_PATTERN.sub(normalize_mixed_script, text_lower)
+    if normalized_text != text_lower:
+        found.update(_search_in_text_worker(normalized_text, words, substr))
+        text_lower = normalized_text
     for kw in words:
         if kw not in found and kw in text_lower:
             found.add(kw)
@@ -584,7 +602,7 @@ def extract_best_effort_text(file_path: str) -> str:
 
 
 def search_in_image(image_data: BytesIO or str, config: dict) -> Set[str]:
-    """Распознавание текста с изображения (RapidOCR / Tesseract)."""
+    """Распознавание текста с изображения через Tesseract."""
     if not config.get('has_ocr', False):
         return set()
 
@@ -640,6 +658,7 @@ def _ensure_ocr_for_pdf(config: dict) -> None:
         return
     try:
         from ocr_engine import setup_ocr
+
         setup_ocr()
     except Exception:
         pass
@@ -727,10 +746,8 @@ def _search_in_pdf_subprocess(pdf_path: str, config: dict) -> Set[str]:
 
 
 def search_in_pdf(pdf_path: str, config: dict) -> Set[str]:
-    """Обработка PDF: в .exe — в текущем процессе (без моргания окна), иначе — subprocess."""
-    if getattr(sys, "frozen", False):
-        return _search_in_pdf_inprocess(pdf_path, config)
-    return _search_in_pdf_subprocess(pdf_path, config)
+    """Обработка PDF в текущем процессе с повторным использованием OCR-моделей."""
+    return _search_in_pdf_inprocess(pdf_path, config)
 
 
 def search_in_docx(docx_path: str, config: dict) -> Set[str]:
@@ -760,18 +777,22 @@ def search_in_docx(docx_path: str, config: dict) -> Set[str]:
                 return search_in_text(fallback_text)
             return set()
 
-        # Текст из документа
-        text = docx2txt.process(docx_path)
-        found.update(search_in_text(text))
-
-        # Изображения из документа (только если есть OCR)
+        # При включённом OCR docx2txt за один проход извлекает и текст, и картинки.
         if config.get('has_ocr', False):
             with tempfile.TemporaryDirectory() as temp_dir:
-                docx2txt.process(docx_path, temp_dir)
+                text = docx2txt.process(docx_path, temp_dir)
+                found.update(search_in_text(text))
+                if _keywords_fully_found(found):
+                    return found
                 for img_file in os.listdir(temp_dir):
                     if img_file.lower().endswith(IMAGE_EXTENSIONS):
                         img_path = os.path.join(temp_dir, img_file)
                         found.update(search_in_image(img_path, config))
+                        if _keywords_fully_found(found):
+                            break
+        else:
+            text = docx2txt.process(docx_path)
+            found.update(search_in_text(text))
     except Exception as e:
         # Если штатная обработка не удалась, пытаемся хотя бы извлечь текст напрямую.
         logging.warning(f"Ошибка стандартной обработки DOCX {docx_path}: {e}. Переход к fallback-обработке.")
@@ -950,6 +971,17 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
                                 except Exception as e:
                                     logging.warning(f"Не удалось открыть файл {file} внутри ZIP {archive_path}: {e}")
                                     continue
+                            elif file.lower().endswith(IMAGE_EXTENSIONS) and config.get('has_ocr', False):
+                                try:
+                                    image_data = BytesIO(z.read(file))
+                                    _record_archive_hits(
+                                        results,
+                                        archive_path,
+                                        file,
+                                        search_in_image(image_data, config),
+                                    )
+                                except Exception as e:
+                                    logging.warning(f"Не удалось обработать изображение {file} внутри ZIP {archive_path}: {e}")
                             else:
                                 try:
                                     z.extract(file, temp_dir)
@@ -968,15 +1000,55 @@ def search_in_archive(archive_path: str, extensions: List[str], config: dict) ->
             with tempfile.TemporaryDirectory() as temp_dir:
                 try:
                     with py7zr.SevenZipFile(archive_path, mode='r') as archive:
-                        for member_name in archive.getnames():
-                            _process_7z_member(
-                                archive,
-                                archive_path,
-                                member_name,
-                                extensions,
-                                config,
-                                temp_dir,
+                        member_names = [
+                            name for name in archive.getnames()
+                            if _archive_member_matches(name, extensions)
+                        ]
+                        # Один проход важен для solid-архивов и заметно быстрее
+                        # многократного extract по одному элементу.
+                        if member_names:
+                            archive.extract(targets=member_names, path=temp_dir)
+
+                    temp_root = os.path.abspath(temp_dir)
+                    for member_name in member_names:
+                        normalized_name = member_name.replace("\\", "/")
+                        extracted_file = os.path.abspath(
+                            os.path.join(temp_dir, normalized_name.replace("/", os.sep))
+                        )
+                        try:
+                            if os.path.commonpath([temp_root, extracted_file]) != temp_root:
+                                logging.warning(
+                                    f"Пропуск небезопасного пути внутри 7Z: {normalized_name}"
+                                )
+                                continue
+                        except ValueError:
+                            continue
+                        if not os.path.isfile(extracted_file):
+                            continue
+                        if normalized_name.lower().endswith(
+                            ('.txt', '.csv', '.log', '.xml', '.html', '.htm')
+                        ):
+                            try:
+                                with open(extracted_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                    content = f.read()
+                                _record_archive_hits(
+                                    results,
+                                    archive_path,
+                                    normalized_name,
+                                    search_in_text(content),
+                                )
+                            except Exception as exc:
+                                logging.warning(
+                                    f"Не удалось прочитать {normalized_name} внутри 7Z "
+                                    f"{archive_path}: {exc}"
+                                )
+                        else:
+                            _process_extracted_archive_member(
                                 results,
+                                archive_path,
+                                normalized_name,
+                                extracted_file,
+                                config,
                             )
                 except Exception as e:
                     logging.error(f"Ошибка обработки 7z архива {archive_path}: {e}")

@@ -265,7 +265,7 @@ class SearchApp:
         except ImportError:
             logging.warning("Модуль rarfile не установлен. Поддержка RAR архивов отключена.")
 
-        # OCR: RapidOCR (основной), Tesseract (fallback)
+        # OCR: Tesseract
         HAS_OCR = setup_ocr()
         if HAS_OCR:
             logging.info(f"OCR backend: {get_ocr_backend()}")
@@ -551,7 +551,7 @@ class SearchApp:
 
         footer_info = ttk.Label(
             settings_tab,
-            text="Версия: v.2.3.0 | Автор: Андрей ОБИС 2026"
+            text="Версия: v.2.4.0 | Автор: Андрей ОБИС 2026"
         )
         footer_info.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.S), pady=(18, 0))
 
@@ -2206,6 +2206,10 @@ class SearchApp:
         """Обновление прогресса в основном потоке"""
         if isinstance(processed_count, int):
             self.processed_files = processed_count
+            if self.total_files > 0:
+                self.search_session_remaining_var.set(
+                    str(max(0, self.total_files - self.processed_files))
+                )
             self.update_dashboard_labels()
         self.update_progress(file_name, in_flight=in_flight)
 

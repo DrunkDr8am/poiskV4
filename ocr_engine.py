@@ -1,20 +1,23 @@
-"""Единый OCR-движок: RapidOCR (основной) + Tesseract (fallback)."""
+"""OCR-движок на базе Tesseract."""
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional, Tuple
+from collections import OrderedDict
+from hashlib import blake2b
+from typing import Optional
 
 # Картинки меньше этого размера (по любой стороне) пропускаются — обычно иконки/декор.
 OCR_MIN_IMAGE_SIDE = 48
 
 _ocr_ready: Optional[bool] = None
-_ocr_backend: str = "none"  # rapidocr_cyrillic | tesseract | none
-_rapidocr_local = threading.local()
-_tesseract_ready = False
+_ocr_backend: str = "none"  # tesseract | none
 _init_lock = threading.Lock()
-_onnx_accel: Optional[Tuple[bool, bool]] = None  # (cuda, dml)
+_ocr_cache_lock = threading.Lock()
+_ocr_text_cache: "OrderedDict[tuple, str]" = OrderedDict()
+_ocr_in_progress: dict[tuple, threading.Event] = {}
+_OCR_CACHE_MAX_ITEMS = 256
 
 
 def get_ocr_backend() -> str:
@@ -26,129 +29,27 @@ def is_ocr_available() -> bool:
 
 
 def setup_ocr() -> bool:
-    """Инициализирует OCR: сначала RapidOCR (кириллица), иначе Tesseract."""
-    global _ocr_ready, _ocr_backend, _tesseract_ready
+    """Инициализирует Tesseract OCR."""
+    global _ocr_ready, _ocr_backend
     with _init_lock:
         if _ocr_ready is not None:
             return _ocr_ready
 
-        if _try_init_rapidocr():
-            _ocr_backend = "rapidocr_cyrillic"
-            _ocr_ready = True
-            logging.info("OCR: используется RapidOCR (кириллица, ONNX Runtime)")
-            return True
-
         try:
             from tesseract_setup import setup_tesseract
 
-            _tesseract_ready = bool(setup_tesseract())
+            if setup_tesseract():
+                _ocr_backend = "tesseract"
+                _ocr_ready = True
+                logging.info("OCR: используется Tesseract")
+                return True
         except Exception as exc:
             logging.warning(f"OCR: не удалось инициализировать Tesseract: {exc}")
-            _tesseract_ready = False
-
-        if _tesseract_ready:
-            _ocr_backend = "tesseract"
-            _ocr_ready = True
-            logging.info("OCR: используется Tesseract (fallback)")
-            return True
 
         _ocr_backend = "none"
         _ocr_ready = False
-        logging.warning("OCR недоступен: ни RapidOCR, ни Tesseract не инициализированы")
+        logging.warning("OCR недоступен: Tesseract не инициализирован")
         return False
-
-
-def _detect_onnx_accelerators() -> Tuple[bool, bool]:
-    """Проверяет наличие CUDA / DirectML в onnxruntime и пишет результат в лог."""
-    global _onnx_accel
-    if _onnx_accel is not None:
-        return _onnx_accel
-
-    has_cuda = False
-    has_dml = False
-    providers = []
-    try:
-        import onnxruntime as ort  # type: ignore
-
-        providers = list(ort.get_available_providers() or [])
-        has_cuda = "CUDAExecutionProvider" in providers
-        has_dml = "DmlExecutionProvider" in providers
-    except Exception as exc:
-        logging.warning(f"OCR GPU: не удалось получить список providers onnxruntime ({exc})")
-        _onnx_accel = (False, False)
-        return _onnx_accel
-
-    if has_cuda:
-        logging.info("OCR GPU: CUDA найден")
-    else:
-        logging.info("OCR GPU: CUDA отсутствует")
-
-    if has_dml:
-        logging.info("OCR GPU: DirectML найден")
-    else:
-        logging.info("OCR GPU: DirectML отсутствует")
-
-    if not has_cuda and not has_dml:
-        logging.info(
-            "OCR GPU: ускорение недоступно, используется CPU "
-            f"(providers={providers})"
-        )
-    else:
-        logging.info(f"OCR GPU: доступные providers={providers}")
-
-    _onnx_accel = (has_cuda, has_dml)
-    return _onnx_accel
-
-
-def _build_rapidocr_engine():
-    """Создаёт RapidOCR с моделью распознавания кириллицы (русский и др.)."""
-    from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR  # type: ignore
-
-    has_cuda, has_dml = _detect_onnx_accelerators()
-    # Предпочитаем CUDA; DirectML включаем, если CUDA нет.
-    use_cuda = bool(has_cuda)
-    use_dml = bool(has_dml and not has_cuda)
-    if use_cuda:
-        logging.info("OCR GPU: RapidOCR будет использовать CUDA")
-    elif use_dml:
-        logging.info("OCR GPU: RapidOCR будет использовать DirectML")
-    else:
-        logging.info("OCR GPU: RapidOCR будет использовать CPU")
-
-    return RapidOCR(
-        params={
-            "Rec.lang_type": LangRec.CYRILLIC,
-            "Rec.ocr_version": OCRVersion.PPOCRV5,
-            "Rec.model_type": ModelType.MOBILE,
-            "EngineConfig.onnxruntime.use_cuda": use_cuda,
-            "EngineConfig.onnxruntime.use_dml": use_dml,
-        }
-    )
-
-
-def _try_init_rapidocr() -> bool:
-    try:
-        import numpy as np  # type: ignore
-        from PIL import Image  # type: ignore
-
-        engine = _build_rapidocr_engine()
-        # Прогрев: убеждаемся, что модели грузятся без падения.
-        probe = Image.new("RGB", (64, 32), color="white")
-        engine(np.asarray(probe))
-        _rapidocr_local.engine = engine
-        return True
-    except Exception as exc:
-        logging.info(f"OCR: RapidOCR недоступен ({exc}), будет проверен Tesseract")
-        return False
-
-
-def _get_rapidocr_engine():
-    engine = getattr(_rapidocr_local, "engine", None)
-    if engine is not None:
-        return engine
-    engine = _build_rapidocr_engine()
-    _rapidocr_local.engine = engine
-    return engine
 
 
 def _normalize_pil(pil_img, preprocess: bool):
@@ -177,36 +78,6 @@ def _is_image_too_small(pil_img) -> bool:
     return width < OCR_MIN_IMAGE_SIDE or height < OCR_MIN_IMAGE_SIDE
 
 
-def _rapidocr_to_text(result) -> str:
-    if result is None:
-        return ""
-    txts = getattr(result, "txts", None)
-    if txts:
-        return "\n".join(str(item) for item in txts if item)
-    # Совместимость со старым API rapidocr_onnxruntime: (boxes, txts, scores), elapse
-    if isinstance(result, (list, tuple)) and result:
-        first = result[0]
-        if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)):
-            # [[box, text, score], ...]
-            lines = []
-            for item in first:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    lines.append(str(item[1]))
-            return "\n".join(lines)
-        if all(isinstance(item, str) for item in first):
-            return "\n".join(first)
-    return str(result) if result else ""
-
-
-def _ocr_with_rapidocr(pil_img) -> str:
-    import numpy as np  # type: ignore
-
-    engine = _get_rapidocr_engine()
-    arr = np.asarray(pil_img)
-    result = engine(arr)
-    return _rapidocr_to_text(result)
-
-
 def _ocr_with_tesseract(pil_img, ocr_lang: str, ocr_cfg: str) -> str:
     import pytesseract  # type: ignore
 
@@ -227,7 +98,7 @@ def ocr_pil_image(
     config: Optional[dict] = None,
     preprocess: bool = True,
 ) -> str:
-    """Распознаёт текст с PIL-изображения текущим OCR-движком."""
+    """Распознаёт текст с PIL-изображения через Tesseract."""
     if pil_img is None:
         return ""
     if _is_image_too_small(pil_img):
@@ -242,16 +113,58 @@ def ocr_pil_image(
 
     config = config or {}
     image = _normalize_pil(pil_img, preprocess=preprocess)
+    ocr_lang = config.get("tesseract_languages", "rus")
+    ocr_cfg = config.get("tesseract_config", "--oem 3 --psm 6")
 
     try:
-        if _ocr_backend.startswith("rapidocr"):
-            return _ocr_with_rapidocr(image)
-        if _ocr_backend == "tesseract":
-            return _ocr_with_tesseract(
-                image,
-                config.get("tesseract_languages", "rus"),
-                config.get("tesseract_config", "--oem 3 --psm 6"),
-            )
+        raw_pixels = image.tobytes()
+        pixel_digest = blake2b(raw_pixels, digest_size=16).digest()
+        del raw_pixels
+        cache_key = (
+            _ocr_backend,
+            image.mode,
+            image.size,
+            bool(preprocess),
+            ocr_lang,
+            ocr_cfg,
+            pixel_digest,
+        )
+    except Exception:
+        cache_key = None
+
+    owner = True
+    wait_event = None
+    if cache_key is not None:
+        with _ocr_cache_lock:
+            cached = _ocr_text_cache.get(cache_key)
+            if cached is not None:
+                _ocr_text_cache.move_to_end(cache_key)
+                return cached
+            wait_event = _ocr_in_progress.get(cache_key)
+            if wait_event is None:
+                wait_event = threading.Event()
+                _ocr_in_progress[cache_key] = wait_event
+            else:
+                owner = False
+
+    if not owner and wait_event is not None:
+        wait_event.wait()
+        with _ocr_cache_lock:
+            return _ocr_text_cache.get(cache_key, "")
+
+    text = ""
+    try:
+        text = _ocr_with_tesseract(image, ocr_lang, ocr_cfg)
     except Exception as exc:
-        logging.error(f"Ошибка OCR ({_ocr_backend}): {exc}")
-    return ""
+        logging.error(f"Ошибка OCR (Tesseract): {exc}")
+    finally:
+        if cache_key is not None:
+            with _ocr_cache_lock:
+                _ocr_text_cache[cache_key] = text
+                _ocr_text_cache.move_to_end(cache_key)
+                while len(_ocr_text_cache) > _OCR_CACHE_MAX_ITEMS:
+                    _ocr_text_cache.popitem(last=False)
+                event = _ocr_in_progress.pop(cache_key, None)
+                if event is not None:
+                    event.set()
+    return text
